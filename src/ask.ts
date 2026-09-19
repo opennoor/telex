@@ -99,7 +99,11 @@ export async function receipt(session: BotSession, chatId: number | string, mess
     parse_mode: "HTML",
     reply_parameters: { message_id: message.message_id, allow_sending_without_reply: true },
   }).catch(() => undefined);
-  if (sent) message.receipt_id = sent.message_id;
+  if (!sent) return;
+  message.receipt_id = sent.message_id;
+  // A shared queue holds a copy, so the id has to be written back or no other process could
+  // settle this receipt.
+  session.recordReceipt(chatId, message.message_id, sent.message_id);
 }
 
 function updateReceipt(session: BotSession, chatId: number | string, message: Incoming, text: string) {

@@ -1,4 +1,5 @@
 /** Thin Telegram Bot API client plus an on-demand long-poll loop per bot token. */
+import { memoryInbox, type InboxStore } from "./inbox.ts";
 
 export type Update = {
   update_id: number;
@@ -125,9 +126,6 @@ type Watch = {
   onExpired?: (messages: Incoming[]) => void;
 };
 
-/** An agent that never checks in must not grow the inbox without bound; oldest go first. */
-const INBOX_LIMIT = 50;
-
 /**
  * One session per bot token. Polling runs while a question is open and, once a chat is watched,
  * for the rest of the process's life — a project that is not running simply never answers.
@@ -141,7 +139,8 @@ export class BotSession {
   private callbackWaiters = new Map<string, CallbackWaiter>();
   private textWaiters = new Map<string, TextWaiter>();
   private watched = new Map<string, Watch>();
-  private inbox = new Map<string, Incoming[]>();
+  /** Where queued messages live. Shared across processes in the server; private in tests. */
+  private store: InboxStore = memoryInbox();
   private ttl = new Map<string, number>();
   private listening = false;
 
@@ -187,12 +186,23 @@ export class BotSession {
     this.ttl.set(String(chatId), ms);
   }
 
+  /**
+   * Queue somewhere every telex process can reach. One process polls and another one heartbeats,
+   * so a queue private to one of them leaves the user's message held by an agent that is not the
+   * one checking in.
+   */
+  setInboxStore(store: InboxStore) {
+    this.store = store;
+  }
+
   /** Hand over everything held for this chat. */
   take(chatId: number | string): Incoming[] {
-    const key = String(chatId);
-    const queued = this.inbox.get(key) ?? [];
-    this.inbox.delete(key);
-    return queued;
+    return this.store.take(String(chatId));
+  }
+
+  /** Remember telex's reply to a message, so whichever process settles it can find the receipt. */
+  recordReceipt(chatId: number | string, messageId: number, receiptId: number) {
+    this.store.receipt(String(chatId), messageId, receiptId);
   }
 
   private get idle() {
@@ -270,7 +280,10 @@ export class BotSession {
     if (watch.allowFrom?.length && !(msg.from && watch.allowFrom.includes(msg.from.id))) return;
     const message: Incoming = { message_id: msg.message_id, from_id: msg.from?.id, text: msg.text!, received_at: now };
     if (watch.accept && !watch.accept()) return watch.onRefused?.(message);
-    this.inbox.set(key, [...(this.inbox.get(key) ?? []), message].slice(-INBOX_LIMIT));
+    // The deadline is fixed when the message is queued, so any process can expire it without
+    // knowing whose interval set it. Before an agent declares one there is no deadline at all.
+    const ttl = this.ttl.get(key);
+    this.store.push(key, message, ttl === undefined ? undefined : now + ttl);
     watch.onQueued?.(message);
   }
 
@@ -279,13 +292,9 @@ export class BotSession {
    * has stopped checking in entirely — which is exactly when the user most needs telling.
    */
   sweepInbox(now = Date.now()) {
-    for (const [key, held] of this.inbox) {
-      const ttl = this.ttl.get(key);
-      if (ttl === undefined) continue;
-      const expired = held.filter((m) => now - m.received_at > ttl);
-      if (!expired.length) continue;
-      this.inbox.set(key, held.filter((m) => now - m.received_at <= ttl));
-      this.watched.get(key)?.onExpired?.(expired);
+    for (const [key, watch] of this.watched) {
+      const expired = this.store.expire(key, now);
+      if (expired.length) watch.onExpired?.(expired);
     }
   }
 }

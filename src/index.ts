@@ -6,6 +6,7 @@ import { loadConfig, pickBot, type Bot } from "./config.ts";
 import { sessionFor, type BotSession } from "./telegram.ts";
 import { ask, receipt, markExpired, refuse, heartbeat, deliver } from "./ask.ts";
 import { touch, release, repoOf, ownerOf, type Session } from "./registry.ts";
+import { fileInbox } from "./inbox.ts";
 import { randomUUID } from "node:crypto";
 
 const config = loadConfig();
@@ -16,9 +17,22 @@ const defaultBot = process.env.TELEX_BOT || config.defaultBot!;
 /** Set once the agent has identified itself; until then telex has no interval and no owner. */
 let checkedIn = false;
 
+/**
+ * Every telex on this machine queues into the same place. One process polls and a different one
+ * may be the one that heartbeats, so a queue private to a process leaves the user's message held
+ * by an agent that is not the one checking in.
+ */
+const shared = fileInbox();
+
+function bind(bot: Bot): BotSession {
+  const session = sessionFor(bot.token);
+  session.setInboxStore(shared);
+  return session;
+}
+
 /** Listen to a bot's chat for messages nobody asked for, and acknowledge each one to the user. */
 function watch(bot: Bot): BotSession {
-  const session = sessionFor(bot.token);
+  const session = bind(bot);
   session.watch(bot.chatId, {
     allowFrom: bot.allowFrom,
     accept: () => checkedIn,
@@ -43,7 +57,7 @@ function claim(botName: string, bot: Bot, sessionId: string): { session: BotSess
   // is one poll cycle and self-correcting; registering needs an identity a caller supplies.
   const owns = (ownerOf(botName) ?? sessionId) === sessionId;
   if (owns) return { session: watch(bot), owns };
-  const session = sessionFor(bot.token);
+  const session = bind(bot);
   session.stop();
   return { session, owns };
 }
