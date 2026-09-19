@@ -5,7 +5,7 @@ import { z } from "zod";
 import { loadConfig, pickBot, type Bot } from "./config.ts";
 import { sessionFor, type BotSession } from "./telegram.ts";
 import { ask, receipt, markExpired, refuse, heartbeat, deliver } from "./ask.ts";
-import { touch, release, repoOf, type Session } from "./registry.ts";
+import { touch, release, repoOf, ownerOf, type Session } from "./registry.ts";
 import { randomUUID } from "node:crypto";
 
 const config = loadConfig();
@@ -29,18 +29,34 @@ function watch(bot: Bot): BotSession {
   return session;
 }
 
+/**
+ * Poll only while this process holds the bot.
+ *
+ * Telegram serves an update to whoever asks and confirms it only when that asker returns with a
+ * higher offset, so two pollers on one token duplicate receipts and swallow replies. Symphony runs
+ * a lead and its workers inside one repository, all on one bot, each with its own telex — which is
+ * how a single message came back acknowledged twice.
+ */
+function claim(botName: string, bot: Bot, sessionId: string): { session: BotSession; owns: boolean } {
+  // Nobody registered yet means nobody to defer to: the first process up starts listening.
+  // Two starting in the same instant both listen until their first check-in settles it, which
+  // is one poll cycle and self-correcting; registering needs an identity a caller supplies.
+  const owns = (ownerOf(botName) ?? sessionId) === sessionId;
+  if (owns) return { session: watch(bot), owns };
+  const session = sessionFor(bot.token);
+  session.stop();
+  return { session, owns };
+}
+
 const warned = new Set<string>();
 
 /**
  * Every call says who is calling. That fixes the expiry clock from the very first interaction and,
  * through the shared registry, lets separate telex processes notice they share a bot.
  */
-function checkIn(botName: string, bot: Bot, caller: Caller): { session: BotSession; sessionId: string } {
-  const session = watch(bot);
+function checkIn(botName: string, bot: Bot, caller: Caller): { session: BotSession; sessionId: string; owns: boolean } {
   const sessionId = caller.session_id ?? processSession;
-  session.setInboxTtl(bot.chatId, caller.interval_seconds * MISSED_BEATS * 1000);
-  checkedIn = true;
-
+  // Register before claiming: ownership is decided from the registry, so this call has to be in it.
   const others = touch({
     session_id: sessionId,
     bot: botName,
@@ -50,12 +66,15 @@ function checkIn(botName: string, bot: Bot, caller: Caller): { session: BotSessi
     pid: process.pid,
     interval_seconds: caller.interval_seconds,
   });
+  const { session, owns } = claim(botName, bot, sessionId);
+  session.setInboxTtl(bot.chatId, caller.interval_seconds * MISSED_BEATS * 1000);
+  checkedIn = true;
   for (const other of others) {
     if (warned.has(other.session_id)) continue;
     warned.add(other.session_id);
     void conflictWarning(session, bot, caller, other);
   }
-  return { session, sessionId };
+  return { session, sessionId, owns };
 }
 
 /** Telegram hands each update to one poller only, so a shared bot silently loses half the traffic. */
@@ -192,8 +211,10 @@ server.registerTool(
   },
 );
 
-// Start listening before any agent checks in, so early messages get refused rather than ignored.
-watch(pickBot(config).bot);
+// Start listening before any agent checks in, so early messages get refused rather than ignored —
+// unless another process in this project already holds the bot, in which case it is doing that.
+const startup = pickBot(config);
+claim(startup.name, startup.bot, processSession);
 
 const transport = new StdioServerTransport();
 // Polling now outlives any single request, so the process has to be told when the agent is gone.

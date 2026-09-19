@@ -102,6 +102,25 @@ export function touch(entry: Registration, now = Date.now()): Session[] {
   return others.filter((s) => s.bot === entry.bot && s.repo !== repo);
 }
 
+/**
+ * The one session allowed to poll a bot.
+ *
+ * Telegram serves an update to whoever asks, and confirms it only when that asker comes back with
+ * a higher offset, so two pollers on one token either lose messages or acknowledge the same one
+ * twice. Symphony runs a lead and its workers inside one repository, each with its own telex
+ * process, which is exactly that case: sharing a repo can mean sharing a bot, but it can never
+ * mean sharing the poll.
+ *
+ * The oldest live claim wins and hands over by itself once that process stops, so the lead keeps
+ * the channel while it lives and a worker never takes it.
+ */
+export function ownerOf(bot: string, now = Date.now()): string | undefined {
+  const live = read()
+    .filter((s) => s.bot === bot && isLive(s, now))
+    .sort((a, b) => a.started_at.localeCompare(b.started_at) || a.session_id.localeCompare(b.session_id));
+  return live[0]?.session_id;
+}
+
 /** Drop this session's record. Best effort — a crash is covered by the liveness check instead. */
 export function release(sessionId: string) {
   try {

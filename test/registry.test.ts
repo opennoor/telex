@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { touch, release, isLive, repoOf, statePath, type Session } from "../src/registry.ts";
+import { touch, release, isLive, repoOf, ownerOf, statePath, type Session } from "../src/registry.ts";
 
 function isolated() {
   process.env.TELEX_STATE = join(mkdtempSync(join(tmpdir(), "telex-")), "sessions.json");
@@ -116,4 +116,51 @@ test("repoOf reports the same repository for a worktree as for its main checkout
 
   assert.equal(repoOf(tree), repoOf(main), "a worktree resolves to its repository");
   assert.equal(repoOf(join(root, "not-a-repo")), join(root, "not-a-repo"), "a plain directory is its own identity");
+});
+
+test("only one session may poll a bot, and it is the oldest live claim", (t) => {
+  isolated();
+  t.after(() => release(SESSION));
+  // Symphony runs a lead and its workers in one repository, each with its own telex
+  // process. Both polling one token is how the same message got two receipts.
+  const older = new Date(Date.now() - 60_000).toISOString();
+  writeFileSync(
+    statePath(),
+    JSON.stringify({ sessions: [{ ...alive({ session_id: OTHER, agent: "lead" }), started_at: older }] }),
+  );
+
+  touch(entry({ agent: "worker" }));
+
+  assert.equal(ownerOf("work"), OTHER, "the lead claimed the bot first and keeps it");
+  assert.notEqual(ownerOf("work"), SESSION, "the worker must not poll");
+});
+
+test("ownership moves on when the owner stops running", (t) => {
+  isolated();
+  t.after(() => release(SESSION));
+  const older = new Date(Date.now() - 60_000).toISOString();
+  // A pid nothing is running under: the previous owner is gone.
+  writeFileSync(
+    statePath(),
+    JSON.stringify({ sessions: [{ ...alive({ session_id: OTHER, agent: "lead", pid: 2 ** 22 }), started_at: older }] }),
+  );
+
+  touch(entry({ agent: "worker" }));
+
+  assert.equal(ownerOf("work"), SESSION, "a dead owner does not hold the bot");
+});
+
+test("ownership is per bot", (t) => {
+  isolated();
+  t.after(() => release(SESSION));
+  const older = new Date(Date.now() - 60_000).toISOString();
+  writeFileSync(
+    statePath(),
+    JSON.stringify({ sessions: [{ ...alive({ session_id: OTHER, bot: "other" }), started_at: older }] }),
+  );
+
+  touch(entry());
+
+  assert.equal(ownerOf("work"), SESSION, "another bot's owner is irrelevant");
+  assert.equal(ownerOf("nobody"), undefined, "a bot with no live session has no owner");
 });
