@@ -1,6 +1,6 @@
 {
   "name": "@sojaner/telex",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "MCP server that lets local AI agents ask users questions through Telegram bots",
   "type": "module",
   "bin": {
