@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { fileURLToPath } from "node:url";
-import { readConfig, writeConfig, configPath, maskToken, type Bot } from "./config.ts";
+import { readConfig, writeConfig, configPath, projectConfigPath, writeProjectConfig, maskToken, type Bot } from "./config.ts";
 import { addBotInteractive, installConfig } from "./setup.ts";
 import { agents, snippet, type Entry } from "./agents.ts";
 
@@ -13,6 +13,7 @@ const USAGE = `telex — send messages from local AI agents to Telegram
   telex set <name> [options]          change a bot
   telex remove <name>                 delete a bot
   telex config [name]                 install the MCP registration into this project
+  telex project <name>                pin this repository to a configured bot
 
 Options for config:
   --agent <id>          skip the prompts: claude, codex, cursor, vscode, zed, ...
@@ -133,6 +134,14 @@ async function run(command: string, name?: string) {
       if (flags.json) return console.log(JSON.stringify({ mcpServers: { telex: entry } }, null, 2));
       if (flags.print) return printConfigs(entry, name);
       await installConfig(name, { agent: flags.agent, scope: flags.scope, yes: flags.yes });
+      return;
+    }
+
+    case "project": {
+      const config = readConfig();
+      required(config.bots, name);
+      writeProjectConfig(name!);
+      console.log(`✓ Pinned this project to "${name}" (${projectConfigPath()})`);
       return;
     }
 

@@ -1,0 +1,14 @@
+{
+  "name": "telex",
+  "version": "0.4.0",
+  "description": "Bidirectional Telegram relay for Claude Code sessions.",
+  "author": {
+    "name": "Sojaner",
+    "url": "https://github.com/Sojaner"
+  },
+  "homepage": "https://github.com/Sojaner/telex",
+  "repository": "https://github.com/Sojaner/telex",
+  "license": "MIT",
+  "keywords": ["telegram", "mcp", "chat", "agent"],
+  "mcpServers": "./.mcp.json"
+}

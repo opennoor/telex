@@ -38,8 +38,9 @@ npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 npm i -g https://github.com/Sojaner/telex/releases/download/v0.1.14/telex.tgz
 ```
 
-Every green push to `main` bumps the patch version, publishes it to npm and attaches the same
-tarball to a GitHub release, so both routes carry identical builds.
+After CI passes on `main`, the release workflow publishes the version declared in `package.json`
+and attaches the same tarball to a GitHub release. If that version is already tagged, the workflow
+increments the patch version instead, so both routes carry identical builds.
 
 Or run it from a checkout:
 
@@ -51,6 +52,13 @@ pnpm run build && pnpm link --global   # or link this checkout as the global tel
 ```
 
 Upgrade with the same install command; uninstall with `npm rm -g @sojaner/telex`.
+
+### Codex and Claude plugins
+
+This repository also contains an installable plugin for Codex and Claude Code. Install telex first,
+then install the `plugins/telex` directory from this checkout (or from an unpacked published package)
+so the host registers the `telex` MCP server. The plugin contains no bot tokens. Its Codex manifest
+is `plugins/telex/.codex-plugin/plugin.json`; its Claude manifest is `plugins/telex/.claude-plugin/plugin.json`.
 
 ---
 
@@ -108,6 +116,7 @@ telex list                    configured bots, tokens masked
 telex set <name> [options]    change token / chat / allowlist / default
 telex remove <name>           delete a bot
 telex config [name]           install the MCP registration into this project
+telex project <name>          pin this repository to a configured bot
 telex serve                   run the MCP server over stdio (what agents launch)
 ```
 
@@ -271,7 +280,8 @@ Which bot a message goes to, in order:
 
 1. The `bot` argument on the tool call, if the agent passes one.
 2. `TELEX_BOT` from the MCP registration — the project's bot.
-3. `defaultBot` from the config file.
+3. `.telex.json` in the repository — written by `telex project <name>` or `telex config <name>`.
+4. `defaultBot` from the config file.
 
 So a project's agent messages its own bot without being told to, and can still reach another bot
 deliberately (`bot: "oncall"` for something urgent, say).
@@ -334,9 +344,13 @@ too, delivered exactly as a heartbeat would:
 
 ### Messages you send first
 
-You can talk to the bot without being asked. An MCP server cannot wake a sleeping agent — agents
-only act when they call a tool — so telex holds what you said until the agent checks in, and
-edits a single receipt under your message as it moves:
+You can talk to the bot without being asked. While an agent session is open, telex long-polls
+Telegram continuously and queues inbound messages immediately; the host still decides when the
+model reads them. An MCP server cannot wake a fully terminated Codex or Claude Code process: their
+documented MCP transports (stdio, HTTP, or SSE) connect tools but do not start an agent turn. An
+idle session receives the message on its next tool call/heartbeat; a terminated host requires its
+own resume or automation facility. Telex holds what you said until the agent checks in, and edits
+a single receipt under your message as it moves:
 
 | What you see | What it means |
 |---|---|
@@ -517,8 +531,8 @@ pnpm run build    # tsc → dist/, normally done by CI
 node src/cli.ts   # run from source; Node strips the types
 ```
 
-`dist/` is not committed. CI runs the tests on Node 22 and 24 with a frozen lockfile, then bumps
-the version, tags it, and publishes a release with the built tarball attached.
+`dist/` is not committed. CI runs the tests on Node 22 and 24 with a frozen lockfile, then tags and
+publishes the declared version (or increments an already-tagged version) with the built tarball attached.
 
 ## License
 

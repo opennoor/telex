@@ -1,7 +1,7 @@
 /** Interactive bot onboarding: validate a token, learn the chat id by watching for a message. */
 import { createInterface } from "node:readline/promises";
 import { apiFor, type Update } from "./telegram.ts";
-import { readConfig, writeConfig, configPath, type Bot } from "./config.ts";
+import { readConfig, writeConfig, configPath, writeProjectConfig, type Bot } from "./config.ts";
 import { agents, runCli, writeFileConfig, ensureGitignored, type Agent, type Entry, type Result } from "./agents.ts";
 
 const say = (s = "") => console.log(s);
@@ -95,7 +95,10 @@ export async function installConfig(bot: string | undefined, flags: { agent?: st
     if (agent.cli) {
       const argv = agent.cli(bot);
       const result = runCli(argv, dir);
-      if (result) return report(result, agent);
+      if (result) {
+        if (result.ok && bot) writeProjectConfig(bot);
+        return report(result, agent);
+      }
       if (!agent.file) throw new Error(`${agent.label}'s CLI ("${argv[0]}") is not on PATH, and it has no config file telex can write.`);
       say(`! ${argv[0]} is not on PATH — writing ${agent.file} instead.\n`);
     }
@@ -111,6 +114,7 @@ export async function installConfig(bot: string | undefined, flags: { agent?: st
     const result = writeFileConfig(agent, entry, dir, local);
     const ignored = local && agent.localFile ? ensureGitignored(dir, agent.localFile) : null;
     report(result, agent);
+    if (result.ok && bot) writeProjectConfig(bot);
     if (ignored) say(`✓ Added ${agent.localFile} to ${ignored}`);
   } finally {
     rl?.close();

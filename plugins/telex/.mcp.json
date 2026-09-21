@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "telex": {
+      "type": "stdio",
+      "command": "telex",
+      "args": ["serve"]
+    }
+  }
+}
