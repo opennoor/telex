@@ -31,6 +31,15 @@ async function fixture() {
   const screen = (text: string, shortcut = "? for shortcuts  ⚠ 1 warning · f2 to view") => process.stdout.write(
     `\x1b[2J\x1b[H${text}\n  GPT-6-Luna default\n  ${shortcut}\n`
   );
+  const render = async (text: string, shortcut?: string) => {
+    screen(text, shortcut);
+    for (let n = 0; n < 50; n++) {
+      const shown = tmux(socket, "capture-pane", "-p", "-t", pane);
+      if (shown.includes(text) && shown.includes(shortcut ?? "? for shortcuts  ⚠ 1 warning · f2 to view")) return;
+      await sleep(20);
+    }
+    throw new Error(`tmux did not render ${text}`);
+  };
   const terminalInput = () => new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("terminal did not receive Enter")), 3000);
     process.stdin.setRawMode(true);
@@ -44,11 +53,11 @@ async function fixture() {
     process.stdin.resume();
   });
 
-  screen("› Ask Codex to do anything");
+  await render("› Ask Codex to do anything");
   assert.equal(probe(target), true, "detached empty editor");
-  screen("› Ask Codex to do anything", "? for shortcuts Run command?");
+  await render("› Ask Codex to do anything", "? for shortcuts Run command?");
   assert.equal(probe(target), false, "unknown footer stays blocked");
-  screen("› Ask Codex to do anything");
+  await render("› Ask Codex to do anything");
   writeFileSync(join(dir, "config.json"), JSON.stringify({ bots: { main: { token: "123:test", chatId: 7, allowFrom: [7] } } }));
   process.env.TELEX_CONFIG = join(dir, "config.json");
   process.env.TELEX_PROJECT_CONFIG = join(dir, "project.json");
@@ -65,13 +74,13 @@ async function fixture() {
   mcp.kill();
   assert.deepEqual(wakeTargetFromConfig(), target, "enrollment resolves this exact pane");
 
-  screen("Working (esc to interrupt)");
+  await render("Working (esc to interrupt)");
   assert.equal(probe(target), false, "busy editor");
-  screen("› draft text");
+  await render("› draft text");
   assert.equal(probe(target), false, "draft editor");
-  screen("Approve this command? Allow Deny");
+  await render("Approve this command? Allow Deny");
   assert.equal(probe(target), false, "approval prompt");
-  screen("› Ask Codex to do anything");
+  await render("› Ask Codex to do anything");
   assert.equal(probe({ ...target, pid: process.ppid }), false, "replacement PID");
   assert.equal(probe({ ...target, socketId: "0:0" }), false, "replacement socket");
 
@@ -86,7 +95,7 @@ async function fixture() {
     for (let n = 0; n < 50 && tmux(socket, "list-clients", "-t", session, "-F", "#{client_name}"); n++) await sleep(20);
   }
 
-  screen("› Ask Codex to do anything");
+  await render("› Ask Codex to do anything");
   const prompt = promptFor("Hej 👋\nsecond line")!;
   const received = terminalInput();
   const child = spawn(process.execPath, [fileURLToPath(import.meta.url)], {
@@ -114,7 +123,7 @@ async function fixture() {
     if (event.type === "edit") edits.push(event.text!);
   });
   try {
-    screen("› Ask Codex to do anything");
+    await render("› Ask Codex to do anything");
     const submitted = terminalInput();
     assert.equal(await submitted, `${promptFor("wake me")}\n`, "Wake submits exactly one prompt");
     assert.deepEqual(store.claimed("7").map((m) => m.message_id), [11], "paste keeps the claim until host confirmation");

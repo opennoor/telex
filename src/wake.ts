@@ -148,9 +148,15 @@ export function submitToPane(target: WakeTarget, prompt: string, id: string, enr
   try {
     if (!enrolled() || !probe(target)) throw new Error("telex: pane changed before paste");
     tmux(target.socket, ["paste-buffer", "-p", "-r", "-d", "-b", buffer, "-t", target.pane]);
-    // Allow Codex to render the draft, then ensure Enter cannot land on an overlay.
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-    if (!enrolled() || !probe(target, false) || !pastedEditor(target, prompt)) throw new Error("telex: pane changed before Enter");
+    // Wait for the rendered draft; verify the pane immediately before Enter.
+    const until = Date.now() + 500;
+    let rendered = false;
+    while (Date.now() < until) {
+      if (!enrolled() || !probe(target, false)) throw new Error("telex: pane changed before Enter");
+      if (pastedEditor(target, prompt)) { rendered = true; break; }
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
+    }
+    if (!rendered) throw new Error("telex: pane changed before Enter");
     tmux(target.socket, ["send-keys", "-t", target.pane, "Enter"]);
   } finally {
     try { tmux(target.socket, ["delete-buffer", "-b", buffer]); } catch { /* paste may have deleted it */ }
