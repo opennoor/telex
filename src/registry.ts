@@ -58,6 +58,9 @@ const read = (): Session[] => {
   }
 };
 
+/** Read-only registrations for a CLI preflight; the wake runtime verifies identity again. */
+export const registeredSessions = (): Session[] => read();
+
 const write = (sessions: Session[]) => {
   const path = statePath();
   mkdirSync(dirname(path), { recursive: true });

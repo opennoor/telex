@@ -16,9 +16,10 @@ function processFields(pid: number) {
   return { parent: Number(fields[1]), start: fields[19] };
 }
 export const processStart = (pid: number) => processFields(pid).start;
+export const processCommand = (pid: number) => readFileSync(`/proc/${pid}/comm`, "utf8").trim();
 
-function descendantOf(pid: number) {
-  let current = process.pid;
+export function processDescendsFrom(child: number, pid: number) {
+  let current = child;
   while (current > 1) {
     if (current === pid) return true;
     current = processFields(current).parent;
@@ -26,8 +27,13 @@ function descendantOf(pid: number) {
   return false;
 }
 
+const descendantOf = (pid: number) => processDescendsFrom(process.pid, pid);
+
 const tmux = (socket: string, args: string[]) =>
   execFileSync("tmux", ["-S", socket, ...args], { encoding: "utf8", timeout: 2000, maxBuffer: 64 * 1024 }).trimEnd();
+
+const footerLine = (line: string) => !line || /^(GPT-|←)/u.test(line) ||
+  /^\? for shortcuts(?:\s+⚠ \d+ warnings? · f2 to view)?$/u.test(line);
 
 /** Enrollment is a private local file; partial or ambiguous bindings stay disabled. */
 export const wakeConfigPath = () => process.env.TELEX_WAKE_CONFIG ?? join(dirname(statePath()), "wake.json");
@@ -80,7 +86,8 @@ export function wakeTargetFromConfig(): WakeTarget | undefined {
   }
   const info = lstatSync(socket);
   if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error("telex: wake socket must belong to this user");
-  if (processFields(pid).start !== start) throw new Error("telex: wake target process changed");
+  if (processFields(pid).start !== start || processCommand(pid) !== "codex")
+    throw new Error("telex: wake needs Codex as the pane process (start it with exec codex)");
   const target = { socket, session, pane: pane!, pid, start, socketId: `${info.dev}:${info.ino}` };
   if (!descendantOf(pid)) throw new Error("telex: MCP server is not a child of the bound Codex pane");
   return target;
@@ -91,7 +98,7 @@ export function probe(target: WakeTarget, requirePrompt = true): boolean {
   try {
     const socket = lstatSync(target.socket);
     if (!socket.isSocket() || `${socket.dev}:${socket.ino}` !== target.socketId) return false;
-    if (processFields(target.pid).start !== target.start || !descendantOf(target.pid)) return false;
+    if (processFields(target.pid).start !== target.start || processCommand(target.pid) !== "codex" || !descendantOf(target.pid)) return false;
     const data = tmux(target.socket, ["display-message", "-p", "-t", target.pane,
       "#{pane_id}\t#{session_name}\t#{pane_pid}\t#{pane_current_command}\t#{pane_dead}\t#{pane_in_mode}\t#{pane_input_off}"]);
     const [pane, session, pid, command, dead, mode, inputOff] = data.split("\t");
@@ -105,7 +112,7 @@ export function probe(target: WakeTarget, requirePrompt = true): boolean {
     const promptIndex = lines.lastIndexOf("› Ask Codex to do anything");
     // This deliberately recognizes only Codex's empty editor. UI changes fail closed.
     return prompts.length === 1 && promptIndex >= 0 &&
-      lines.slice(promptIndex + 1).every((line) => !line || /^(GPT-|←)/.test(line)) &&
+      lines.slice(promptIndex + 1).every(footerLine) &&
       !/Working|esc to interrupt|Approve|Allow|Deny|Permission/i.test(lines.join("\n"));
   } catch {
     return false;
@@ -124,7 +131,7 @@ function pastedEditor(target: WakeTarget, prompt: string): boolean {
     const prompts = lines.filter((line) => line.startsWith("› "));
     const index = lines.indexOf(`› ${prompt}`);
     return prompts.length === 1 && index >= 0 &&
-      lines.slice(index + 1).every((line) => !line || /^(GPT-|←)/u.test(line)) &&
+      lines.slice(index + 1).every(footerLine) &&
       !/Working|esc to interrupt|Approve|Allow|Deny|Permission/i.test(lines.filter((_, i) => i !== index).join("\n"));
   } catch { return false; }
 }

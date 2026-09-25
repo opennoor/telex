@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.7.0        # pin an exact published version
+npm i -g @sojaner/telex@0.7.1        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -376,9 +376,29 @@ dropped.
 
 Telex can submit a Telegram message to **the same running Codex CLI conversation** after its turn
 finishes. This is off by default. It requires the Codex plugin hooks, a bot with a nonempty
-`allowFrom` list, Linux `/proc`, and a dedicated tmux pane running `codex` directly. The pane must
-be detached before enrollment and remain detached while wake is enabled; Telex will not type into
-an attached pane, a draft, copy mode, an approval screen, or a pane whose process changed.
+`allowFrom` list, Linux `/proc`, and a dedicated tmux pane whose direct process is Codex. Start
+Codex with `--no-daemon` so its Telex MCP server runs under that pane. The default daemon-hosted
+Codex mode cannot be bound: Telex cannot prove that its MCP process belongs to the pane. The pane
+must be detached before enrollment and remain detached while wake is enabled; Telex will not type
+into an attached pane, a draft, copy mode, an approval screen, or a pane whose process changed.
+
+For a conversation already running in the default daemon mode, first install the new Telex version
+and check `telex list` for your bot's nonempty `allow` IDs. Run `/status` in Codex and note its
+Session UUID, then exit that Codex process. If its tmux pane returns to a shell, resume its
+**saved conversation** there:
+
+```sh
+npm i -g @sojaner/telex@0.7.1
+exec codex --no-daemon resume <session-id>
+```
+
+`resume` preserves the saved thread and its context, but starts a new Codex process and Telex MCP
+server; installing the package cannot reload an already-running MCP process. `exec` makes Codex
+the pane process rather than leaving a shell underneath it. If the old pane closed on exit, create
+a new dedicated tmux pane and run the same `exec codex --no-daemon resume <session-id>` command in
+it. Finish a new turn so the v0.7.1 Telex server sees a fresh `Stop` hook, then detach. On a new
+conversation, start it directly with
+`exec codex --no-daemon` and likewise finish a turn before binding.
 
 After Codex has finished a turn, note its pane ID and socket path, detach that tmux session
 (normally `Ctrl-b d`), then run from another terminal:
@@ -389,10 +409,10 @@ telex wake bind %12 --socket /absolute/tmux/socket
 ```
 
 Use the actual `%` pane ID; `telex wake bind` records its tmux session, PID and process start time
-in the private state file and the already-running Telex MCP server picks it up. The last idle
-`Stop` hook must be at most ten minutes old. If it is older, finish another Codex turn and bind
-after it stops. No new Codex thread is created. `telex wake disable` removes the binding; attach
-only after disabling wake.
+in the private state file and the already-running Telex MCP server picks it up. Binding requires a
+recently checked-in Telex MCP child of that pane. Wake also needs an idle `Stop` hook at most ten
+minutes old. If the hook is older, finish another Codex turn and bind after it stops. No new Codex
+thread is created. `telex wake disable` removes the binding; attach only after disabling wake.
 
 Telex waits for an empty Codex prompt, then pastes one physical line containing the Telegram
 message as a JSON string and presses Enter. This preserves Unicode and multiline text without

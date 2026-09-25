@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { fileInbox } from "../src/inbox.ts";
 import { Wake, fitsWidth, probe, promptFor, submitToPane, wakeTargetFromConfig } from "../src/wake.ts";
 import { BotSession, type Incoming } from "../src/telegram.ts";
+import { touch } from "../src/registry.ts";
 
 const tmux = (socket: string, ...args: string[]) =>
   execFileSync("tmux", ["-S", socket, ...args], { encoding: "utf8", timeout: 3000 }).trim();
@@ -26,7 +28,9 @@ async function fixture() {
   const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
   const info = lstatSync(socket);
   const target = { socket, session, pane, pid: process.pid, start, socketId: `${info.dev}:${info.ino}` };
-  const screen = (text: string) => process.stdout.write(`\x1b[2J\x1b[H${text}\n`);
+  const screen = (text: string, shortcut = "? for shortcuts  ⚠ 1 warning · f2 to view") => process.stdout.write(
+    `\x1b[2J\x1b[H${text}\n  GPT-6-Luna default\n  ${shortcut}\n`
+  );
   const terminalInput = () => new Promise<string>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error("terminal did not receive Enter")), 3000);
     process.stdin.setRawMode(true);
@@ -42,12 +46,23 @@ async function fixture() {
 
   screen("› Ask Codex to do anything");
   assert.equal(probe(target), true, "detached empty editor");
+  screen("› Ask Codex to do anything", "? for shortcuts Run command?");
+  assert.equal(probe(target), false, "unknown footer stays blocked");
+  screen("› Ask Codex to do anything");
   writeFileSync(join(dir, "config.json"), JSON.stringify({ bots: { main: { token: "123:test", chatId: 7, allowFrom: [7] } } }));
   process.env.TELEX_CONFIG = join(dir, "config.json");
   process.env.TELEX_PROJECT_CONFIG = join(dir, "project.json");
   process.env.TELEX_WAKE_CONFIG = join(dir, "wake.json");
-  execFileSync(process.execPath, [fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), "wake", "bind", pane, "--socket", socket],
-    { env: process.env });
+  process.env.TELEX_STATE = join(dir, "sessions.json");
+  const bind = () => execFileSync(process.execPath,
+    [fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), "wake", "bind", pane, "--socket", socket],
+    { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+  assert.throws(bind, /Default daemon-hosted Codex cannot bind/, "a pane without its own MCP child cannot enroll");
+  const mcp = spawn("sleep", ["300"], { stdio: "ignore" });
+  touch({ session_id: "fixture", bot: createHash("sha256").update("123:test").digest("hex"),
+    project: process.cwd(), agent: "codex", pid: mcp.pid!, interval_seconds: 60 });
+  bind();
+  mcp.kill();
   assert.deepEqual(wakeTargetFromConfig(), target, "enrollment resolves this exact pane");
 
   screen("Working (esc to interrupt)");

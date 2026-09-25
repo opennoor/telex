@@ -9,9 +9,10 @@ import { createInterface } from "node:readline/promises";
 import { readConfig, writeConfig, loadConfig, configPath, projectConfigPath, writeProjectConfig, maskToken, pickBot, type Bot } from "./config.ts";
 import { addBotInteractive, installConfig } from "./setup.ts";
 import { agents, snippet, type Entry } from "./agents.ts";
-import { wakeConfigPath, processStart, withWakeInputLock } from "./wake.ts";
+import { wakeConfigPath, processStart, processCommand, processDescendsFrom, withWakeInputLock } from "./wake.ts";
 import { fileInbox, scopedInbox } from "./inbox.ts";
 import { apiFor, TelegramError } from "./telegram.ts";
+import { isLive, registeredSessions } from "./registry.ts";
 
 const USAGE = `telex — send messages from local AI agents to Telegram
 
@@ -197,6 +198,21 @@ async function wakeCommand(action?: string) {
       throw new Error("detach the target tmux session before enrolling it for remote input");
     }
     const pid = Number(rawPid);
+    if (processCommand(pid) !== "codex") throw new Error(
+      "wake needs Codex itself as the pane process; start it with `exec codex --no-daemon resume <session-id>`"
+    );
+    const botKey = createHash("sha256").update(bot.token).digest("hex");
+    const hostedHere = registeredSessions().some((entry) => {
+      try {
+        return entry.agent === "codex" && entry.bot === botKey && isLive(entry, Date.now()) &&
+          processDescendsFrom(entry.pid, pid);
+      } catch { return false; }
+    });
+    if (!hostedHere) throw new Error(
+      "wake needs a recently checked-in Telex MCP process under this Codex pane. " +
+      "Default daemon-hosted Codex cannot bind. Install Telex v0.7.1, then resume this saved " +
+      "conversation with `exec codex --no-daemon resume <session-id>`, finish a turn, detach, and bind."
+    );
     const config = { socket: flags.socket, session, pane, pid, start: processStart(pid) };
     mkdirSync(dirname(path), { recursive: true });
     writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: "wx" });
