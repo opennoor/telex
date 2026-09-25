@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.5.1        # pin an exact published version
+npm i -g @sojaner/telex@0.6.0        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -202,7 +202,7 @@ it does not. The server command is always `telex serve`.
 
 | Flag | Meaning |
 |---|---|
-| `--agent <id>` | skip the prompts: `claude`, `gemini`, `qwen`, `codex`, `cursor`, `roo`, `vscode`, `zed`, `amp`, `opencode`, `crush` |
+| `--agent <id>` | skip the prompts: `claude`, `codex` |
 | `--scope local\|project` | for agents with both: the gitignored file or the committed one |
 | `--print` | only show the commands and file shapes; write nothing |
 | `-y` | don't ask about the current directory |
@@ -216,8 +216,6 @@ Agents that install it themselves — `telex config --agent claude` runs:
 
 ```sh
 claude mcp add --scope project telex -- telex serve      # Claude Code
-gemini mcp add --scope project telex telex serve         # Gemini CLI
-qwen mcp add --scope project telex telex serve           # Qwen Code
 ```
 
 Agents telex configures by writing the file — same server, different shape per agent:
@@ -225,19 +223,14 @@ Agents telex configures by writing the file — same server, different shape per
 | Agent | File | Shape |
 |---|---|---|
 | Claude Code | `.mcp.json` | `{"mcpServers": {"telex": {"command": "telex", "args": ["serve"]}}}` |
-| Cursor | `.cursor/mcp.json` | same as above |
-| Roo Code | `.roo/mcp.json` | same as above |
-| VS Code | `.vscode/mcp.json` | `{"servers": {"telex": {"type": "stdio", "command": "telex", "args": ["serve"]}}}` |
-| Zed | `.zed/settings.json` | `{"context_servers": {"telex": {"source": "custom", "command": "telex", "args": ["serve"]}}}` |
-| Amp | `.amp/settings.json` | `{"amp.mcpServers": {"telex": {"command": "telex", "args": ["serve"]}}}` |
-| opencode | `opencode.json` | `{"mcp": {"telex": {"type": "local", "command": ["telex", "serve"]}}}` |
-| Crush | `.crush.json` | `{"mcp": {"telex": {"type": "stdio", "command": "telex", "args": ["serve"]}}}` |
 | Codex CLI | `.codex/config.toml` or `.codex/config.local.toml` | `[mcp_servers.telex]` / `command = "telex"` / `args = ["serve"]` |
 
 Codex is the one with two files: `.codex/config.toml` is committed and shared with the team,
 `.codex/config.local.toml` is your own and gitignored — `--scope project` or `--scope local`.
-Codex only reads either for projects you have marked trusted. Anything else that
-speaks MCP takes the `mcpServers` shape — `claude_desktop_config.json`, Continue, and the rest.
+Codex only reads either for projects you have marked trusted. Other MCP clients can still run
+`telex serve` through a manual server registration. Use `telex config --json` for a standard
+`mcpServers` entry, then adapt its shape to your client's config format. Existing registrations
+continue to work; only the `telex config --agent` shortcuts for other clients were removed.
 
 For one bot everywhere instead of one
 per project, install at user scope: `claude mcp add --scope user telex -- telex serve`.

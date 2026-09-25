@@ -25,16 +25,7 @@ export function agents(): Agent[] {
   return [
     { id: "claude", label: "Claude Code", file: ".mcp.json", path: ["mcpServers", "telex"], value: std,
       cli: (bot) => ["claude", "mcp", "add", "--scope", "project", "telex", ...(bot ? ["--env", `TELEX_BOT=${bot}`] : []), "--", "telex", "serve"] },
-    { id: "gemini", label: "Gemini CLI", cli: (bot) => ["gemini", "mcp", "add", "--scope", "project", ...(bot ? ["-e", `TELEX_BOT=${bot}`] : []), "telex", "telex", "serve"] },
-    { id: "qwen", label: "Qwen Code", cli: (bot) => ["qwen", "mcp", "add", "--scope", "project", ...(bot ? ["-e", `TELEX_BOT=${bot}`] : []), "telex", "telex", "serve"] },
     { id: "codex", label: "Codex CLI", file: ".codex/config.toml", localFile: ".codex/config.local.toml", toml: true },
-    { id: "cursor", label: "Cursor", file: ".cursor/mcp.json", path: ["mcpServers", "telex"], value: std },
-    { id: "roo", label: "Roo Code", file: ".roo/mcp.json", path: ["mcpServers", "telex"], value: std },
-    { id: "vscode", label: "VS Code", file: ".vscode/mcp.json", path: ["servers", "telex"], value: (e) => ({ type: "stdio", ...e }) },
-    { id: "zed", label: "Zed", file: ".zed/settings.json", path: ["context_servers", "telex"], value: (e) => ({ source: "custom", ...e }) },
-    { id: "amp", label: "Amp", file: ".amp/settings.json", path: ["amp.mcpServers", "telex"], value: std },
-    { id: "opencode", label: "opencode", file: "opencode.json", path: ["mcp", "telex"], value: (e) => ({ type: "local", command: [e.command, ...e.args], ...(e.env ? { environment: e.env } : {}) }) },
-    { id: "crush", label: "Crush", file: ".crush.json", path: ["mcp", "telex"], value: (e) => ({ type: "stdio", ...e }) },
   ];
 }
 

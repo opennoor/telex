@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,6 +24,32 @@ test("CLI adds, modifies, routes, and removes a bot", () => {
   assert.deepEqual(JSON.parse(readFileSync(join(dir, ".telex.json"), "utf8")), { bot: "main" });
   run("remove", "main");
   assert.deepEqual(JSON.parse(readFileSync(config, "utf8")).bots, {});
+});
+
+test("config offers only plugin hosts and rejects removed shortcuts without writing files", () => {
+  const dir = mkdtempSync(join(tmpdir(), "telex-config-"));
+  const config = join(dir, "bots.json");
+  const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+  const env = { ...process.env, TELEX_CONFIG: config };
+  const run = (...args: string[]) => spawnSync(process.execPath, [cli, ...args], { cwd: dir, encoding: "utf8", env });
+
+  const help = run("--help");
+  assert.equal(help.status, 0);
+  assert.match(help.stdout, /--agent <id>\s+skip the prompts: claude, codex/);
+  const printed = run("config", "--print");
+  assert.equal(printed.status, 0);
+  assert.match(printed.stdout, /Claude Code/);
+  assert.match(printed.stdout, /Codex CLI/);
+  assert.doesNotMatch(printed.stdout, /Gemini|Qwen|Cursor|Roo|VS Code|Zed|Amp|opencode|Crush/);
+
+  for (const removed of ["gemini", "qwen", "cursor", "roo", "vscode", "zed", "amp", "opencode", "crush"]) {
+    const result = run("config", "--agent", removed, "--scope", "project");
+    assert.equal(result.status, 1, removed);
+    assert.match(result.stderr, /Known: claude, codex/, removed);
+  }
+  assert.deepEqual(readdirSync(dir), []);
+  assert.equal(existsSync(config), false);
+  assert.deepEqual(JSON.parse(run("config", "--json").stdout).mcpServers.telex, { command: "telex", args: ["serve"] });
 });
 
 test("CLI installs the bundled plugin through each host and reuses its marketplace", () => {

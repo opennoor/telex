@@ -21,7 +21,7 @@ const USAGE = `telex — send messages from local AI agents to Telegram
   telex install [codex|claude]        install the bundled plugin for every project
 
 Options for config:
-  --agent <id>          skip the prompts: claude, codex, cursor, vscode, zed, ...
+  --agent <id>          skip the prompts: claude, codex
   --scope <local|project>  for agents with both: gitignored file or committed file
   --print               only show the commands and file syntax; write nothing
   -y, --yes             don't ask about the current directory
