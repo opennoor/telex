@@ -1,5 +1,7 @@
 node_modules/
 dist/
+.test-dist/
+.codebase-memory/
 config.json
 *.tgz
 package-lock.json

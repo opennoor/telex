@@ -6,8 +6,11 @@ import { loadConfig, pickBot, type Bot } from "./config.ts";
 import { sessionFor, type BotSession } from "./telegram.ts";
 import { ask, receipt, markExpired, refuse, heartbeat, deliver } from "./ask.ts";
 import { touch, release, repoOf, ownerOf, type Session } from "./registry.ts";
-import { fileInbox } from "./inbox.ts";
-import { randomUUID } from "node:crypto";
+import { fileInbox, scopedInbox } from "./inbox.ts";
+import { fileAnswers } from "./answers.ts";
+import { createHash, randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import { hookOutput, hostSessionId } from "./host.ts";
 
 const config = loadConfig();
 const botNames = Object.keys(config.bots);
@@ -15,7 +18,9 @@ const botNames = Object.keys(config.bots);
 const defaultBot = process.env.TELEX_BOT || config.defaultBot!;
 
 /** Set once the agent has identified itself; until then telex has no interval and no owner. */
-let checkedIn = false;
+const checkedIn = new Set<string>();
+/** Public MCP identity may be echoed across calls or a host restart. */
+let activeSession: string = randomUUID();
 
 /**
  * Every telex on this machine queues into the same place. One process polls and a different one
@@ -26,7 +31,8 @@ const shared = fileInbox();
 
 function bind(bot: Bot): BotSession {
   const session = sessionFor(bot.token);
-  session.setInboxStore(shared);
+  session.setInboxStore(scopedInbox(shared, pollKey(bot)));
+  session.setAnswerStore(fileAnswers(bot.token));
   return session;
 }
 
@@ -35,7 +41,7 @@ function watch(bot: Bot): BotSession {
   const session = bind(bot);
   session.watch(bot.chatId, {
     allowFrom: bot.allowFrom,
-    accept: () => checkedIn,
+    accept: () => checkedIn.has(pollKey(bot)),
     onRefused: (message) => void refuse(session, bot.chatId, message),
     onQueued: (message) => void receipt(session, bot.chatId, message),
     onExpired: (messages) => markExpired(session, bot.chatId, messages),
@@ -51,15 +57,35 @@ function watch(bot: Bot): BotSession {
  * a lead and its workers inside one repository, all on one bot, each with its own telex — which is
  * how a single message came back acknowledged twice.
  */
-function claim(botName: string, bot: Bot, sessionId: string): { session: BotSession; owns: boolean } {
-  // Nobody registered yet means nobody to defer to: the first process up starts listening.
-  // Two starting in the same instant both listen until their first check-in settles it, which
-  // is one poll cycle and self-correcting; registering needs an identity a caller supplies.
-  const owns = (ownerOf(botName) ?? sessionId) === sessionId;
-  if (owns) return { session: watch(bot), owns };
+const pollKey = (bot: Bot) => createHash("sha256").update(bot.token).digest("hex");
+const registrationId = (bot: Bot) => `${processSession}:${pollKey(bot)}`;
+const claimState = new Map<string, boolean>();
+const monitoredBots = new Map<string, Bot>();
+
+function claim(bot: Bot, sessionId: string): { session: BotSession; owns: boolean } {
+  // ponytail: before either process checks in there can be two brief startup polls. A process
+  // lease would close this gap; keep early-message refusal without a second always-on daemon.
+  const key = pollKey(bot);
+  const owns = (ownerOf(key) ?? sessionId) === sessionId;
+  if (claimState.get(key) === owns) return { session: sessionFor(bot.token), owns };
+  claimState.set(key, owns);
+  if (owns) {
+    const session = watch(bot);
+    session.setPollingOwner(true);
+    return { session, owns };
+  }
   const session = bind(bot);
+  session.setPollingOwner(false);
   session.stop();
   return { session, owns };
+}
+
+/** Reconcile ownership while a question waits, even if the host emits no further hooks. */
+function monitor(bot: Bot) {
+  const key = pollKey(bot);
+  if (monitoredBots.has(key)) return;
+  monitoredBots.set(key, bot);
+  setInterval(() => claim(bot, registrationId(bot)), 1000).unref();
 }
 
 const warned = new Set<string>();
@@ -68,21 +94,23 @@ const warned = new Set<string>();
  * Every call says who is calling. That fixes the expiry clock from the very first interaction and,
  * through the shared registry, lets separate telex processes notice they share a bot.
  */
-function checkIn(botName: string, bot: Bot, caller: Caller): { session: BotSession; sessionId: string; owns: boolean } {
-  const sessionId = caller.session_id ?? processSession;
-  // Register before claiming: ownership is decided from the registry, so this call has to be in it.
+function checkIn(bot: Bot, caller: Caller): { session: BotSession; sessionId: string; owns: boolean } {
+  const sessionId = caller.session_id ?? activeSession;
+  activeSession = sessionId;
+  // Registry ownership belongs to this process even when two hosts echo the same public session id.
   const others = touch({
-    session_id: sessionId,
-    bot: botName,
+    session_id: registrationId(bot),
+    bot: pollKey(bot),
     project: caller.project_path,
     repo: repoOf(caller.project_path),
     agent: caller.agent,
     pid: process.pid,
     interval_seconds: caller.interval_seconds,
   });
-  const { session, owns } = claim(botName, bot, sessionId);
+  const { session, owns } = claim(bot, registrationId(bot));
+  monitor(bot);
   session.setInboxTtl(bot.chatId, caller.interval_seconds * MISSED_BEATS * 1000);
-  checkedIn = true;
+  checkedIn.add(pollKey(bot));
   for (const other of others) {
     if (warned.has(other.session_id)) continue;
     warned.add(other.session_id);
@@ -91,34 +119,32 @@ function checkIn(botName: string, bot: Bot, caller: Caller): { session: BotSessi
   return { session, sessionId, owns };
 }
 
-/** Telegram hands each update to one poller only, so a shared bot silently loses half the traffic. */
+/** Two unrelated projects cannot know which one an unsolicited chat message was meant for. */
 function conflictWarning(session: BotSession, bot: Bot, mine: Caller, other: Session) {
   return session.api("sendMessage", {
     chat_id: bot.chatId,
     parse_mode: "HTML",
     text: [
-      "⚠️ <b>Two agents are using this bot at once</b>",
+      "⚠️ <b>Two projects are using this bot at once</b>",
       "",
       `<code>${mine.agent}</code> — <code>${mine.project_path}</code>`,
       `<code>${other.agent}</code> — <code>${other.project}</code>`,
       "",
-      "Telegram gives each message to only one of them, so answers will go missing.",
+      "Messages in this chat cannot be routed reliably between projects.",
       "Give each project its own bot: <code>telex add &lt;name&gt;</code>.",
     ].join("\n"),
   }).catch(() => {});
 }
 
-const server = new McpServer({ name: "telex", version: "0.1.0" });
+const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
+const server = new McpServer({ name: "telex", version });
 /** Heartbeats a message may sit through before telex gives up on the agent's behalf. */
 const MISSED_BEATS = 3;
 
 type Caller = { project_path: string; agent: string; interval_seconds: number; session_id?: string };
 
-/**
- * Identifies this run of the server. An agent that never echoes its session id still gets one
- * stable identity; one that does keeps it across a restart, or hands it to whoever calls next.
- */
-const processSession = randomUUID();
+/** Poll ownership is per process, even if two processes receive the same host session id. */
+const processSession = activeSession;
 
 /** Identity every call carries, so telex knows who is on the other end and how often to expect them. */
 const identity = {
@@ -176,8 +202,8 @@ server.registerTool(
     },
   },
   async ({ project, message, options, expect_text, timeout_seconds, bot, ...caller }) => {
-    const { name: targetName, bot: target } = pickBot(config, bot);
-    const { session, sessionId } = checkIn(targetName, target, caller);
+    const { bot: target } = pickBot(config, bot);
+    const { session, sessionId } = checkIn(target, caller);
     const result = await ask(session, target.chatId, {
       project,
       message,
@@ -209,7 +235,7 @@ server.registerTool(
       "nothing was said — that is the normal case, keep working and check in again next interval.",
       "",
       "'project_path' and 'agent' identify you. telex records them so it can warn the user when two",
-      "projects end up sharing one bot, which silently costs them half their messages.",
+      "projects share one bot and unsolicited messages become ambiguous.",
       `Bots: ${botNames.join(", ")} (default for this project: ${defaultBot}).`,
     ].join("\n"),
     inputSchema: {
@@ -219,22 +245,51 @@ server.registerTool(
     },
   },
   async ({ bot, ...caller }) => {
-    const { name: targetName, bot: target } = pickBot(config, bot);
-    const { session, sessionId } = checkIn(targetName, target, caller);
+    const { bot: target } = pickBot(config, bot);
+    const { session, sessionId } = checkIn(target, caller);
     return json({ messages: heartbeat(session, target.chatId), interval_seconds: caller.interval_seconds, session_id: sessionId });
+  },
+);
+
+// Native plugin hooks call this tool at host lifecycle events. The MCP process remains the
+// sole Telegram poller, and the same check-in/delivery path serves hosts without hook support.
+server.registerTool(
+  "host_hook",
+  {
+    title: "Telex host lifecycle hook",
+    description: "Plugin hook entry point. Host-managed calls check in and deliver Telegram messages to the active turn.",
+    inputSchema: {
+      event: z.enum(["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"]),
+      host_session_id: z.string().min(1),
+      project_path: identity.project_path,
+      agent: identity.agent,
+      stop_hook_active: z.union([z.boolean(), z.enum(["true", "false"]).transform((value) => value === "true")]).optional(),
+    },
+  },
+  async ({ event, host_session_id, project_path, agent, stop_hook_active }) => {
+    const { bot } = pickBot(config);
+    const { session } = checkIn(bot, {
+      project_path, agent, interval_seconds: 60, session_id: hostSessionId(agent, host_session_id, processSession),
+    });
+    // A second Stop continuation must not consume a new message that it cannot pass to the model.
+    const messages = event === "Stop" && stop_hook_active ? [] : heartbeat(session, bot.chatId);
+    return json(hookOutput(event, messages));
   },
 );
 
 // Start listening before any agent checks in, so early messages get refused rather than ignored —
 // unless another process in this project already holds the bot, in which case it is doing that.
 const startup = pickBot(config);
-claim(startup.name, startup.bot, processSession);
+claim(startup.bot, registrationId(startup.bot));
+monitor(startup.bot);
 
 const transport = new StdioServerTransport();
 // Polling now outlives any single request, so the process has to be told when the agent is gone.
 transport.onclose = () => {
-  release(processSession);
+  for (const bot of monitoredBots.values()) release(registrationId(bot));
   process.exit(0);
 };
-process.on("exit", () => release(processSession));
+process.on("exit", () => {
+  for (const bot of monitoredBots.values()) release(registrationId(bot));
+});
 await server.connect(transport);

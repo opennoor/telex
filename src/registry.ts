@@ -95,11 +95,12 @@ export function touch(entry: Registration, now = Date.now()): Session[] {
   const stamp = new Date(now).toISOString();
   const repo = entry.repo ?? repoOf(entry.project);
   const existing = read();
-  const others = existing.filter((s) => s.session_id !== entry.session_id && isLive(s, now));
+  // Polling stays with a running server even while the host has no hook events to report.
+  const others = existing.filter((s) => s.session_id !== entry.session_id && running(s.pid));
   const mine = existing.find((s) => s.session_id === entry.session_id);
   write([...others, { ...entry, repo, started_at: mine?.started_at ?? stamp, last_seen: stamp }]);
   // Worktrees of one repository are one project sharing one bot deliberately; that is not a clash.
-  return others.filter((s) => s.bot === entry.bot && s.repo !== repo);
+  return others.filter((s) => isLive(s, now) && s.bot === entry.bot && s.repo !== repo);
 }
 
 /**
@@ -111,12 +112,12 @@ export function touch(entry: Registration, now = Date.now()): Session[] {
  * process, which is exactly that case: sharing a repo can mean sharing a bot, but it can never
  * mean sharing the poll.
  *
- * The oldest live claim wins and hands over by itself once that process stops, so the lead keeps
- * the channel while it lives and a worker never takes it.
+ * The oldest running process wins until it exits. Host check-ins may be sparse while a long
+ * question waits, but that must not hand polling to a second process.
  */
-export function ownerOf(bot: string, now = Date.now()): string | undefined {
+export function ownerOf(bot: string): string | undefined {
   const live = read()
-    .filter((s) => s.bot === bot && isLive(s, now))
+    .filter((s) => s.bot === bot && running(s.pid))
     .sort((a, b) => a.started_at.localeCompare(b.started_at) || a.session_id.localeCompare(b.session_id));
   return live[0]?.session_id;
 }

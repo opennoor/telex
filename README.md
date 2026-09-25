@@ -1,7 +1,7 @@
 # telex
 
-An MCP server that lets local AI agents talk to you through Telegram — ask a question, offer
-buttons, collect a typed reply, and give up gracefully when you are away.
+A Telegram plugin for Codex and Claude Code, with an MCP server and CLI for other agents. It sends
+notifications, asks questions with buttons or typed replies, and delivers messages you send first.
 
 Your agent is running a long task, hits a decision it shouldn't make alone, and you are not at
 the keyboard. Instead of guessing or stalling, it sends you a Telegram message with two buttons
@@ -13,10 +13,9 @@ telex is local-only: it runs over stdio next to your agent, talks outbound to th
 API, and only ever messages the chats you configured. Nothing listens on a port.
 
 ```
-┌────────┐   stdio/MCP   ┌───────┐   Bot API   ┌──────────┐
-│ agent  │ ────────────▶ │ telex │ ──────────▶ │ Telegram │ ──▶ you
-└────────┘   ◀────────── └───────┘   ◀────────  └──────────┘
-             the answer               your tap
+┌────────┐  plugin hooks  ┌───────┐   Bot API   ┌──────────┐
+│ agent  │ ◀───────────── │ telex │ ◀────────── │ Telegram │ ◀── you
+└────────┘  stdio/MCP ──▶ └───────┘ ──────────▶ └──────────┘
 ```
 
 ---
@@ -33,9 +32,8 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.1          # a range, or any exact published version
+npm i -g @sojaner/telex@0.5.0        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
-npm i -g https://github.com/Sojaner/telex/releases/download/v0.1.14/telex.tgz
 ```
 
 After CI passes on `main`, the release workflow publishes the version declared in `package.json`
@@ -47,18 +45,33 @@ Or run it from a checkout:
 ```sh
 git clone https://github.com/Sojaner/telex && cd telex
 corepack enable && pnpm install
-node src/cli.ts --help          # runs the TypeScript directly, no build
-pnpm run build && pnpm link --global   # or link this checkout as the global telex
+pnpm run telex --help           # builds and runs the CLI
+pnpm link --global             # or link this checkout as the global telex
 ```
 
 Upgrade with the same install command; uninstall with `npm rm -g @sojaner/telex`.
 
 ### Codex and Claude plugins
 
-This repository also contains an installable plugin for Codex and Claude Code. Install telex first,
-then install the `plugins/telex` directory from this checkout (or from an unpacked published package)
-so the host registers the `telex` MCP server. The plugin contains no bot tokens. Its Codex manifest
-is `plugins/telex/.codex-plugin/plugin.json`; its Claude manifest is `plugins/telex/.claude-plugin/plugin.json`.
+This repository also contains a plugin for Codex and Claude Code. Install telex first, then install
+the `plugins/telex` directory from this checkout (or an unpacked published package) with the host's
+plugin installer. In each project, run `telex add` and `telex project <name>` to choose a bot. The
+plugin contains no bot tokens and keeps the MCP registration in `plugins/telex/.mcp.json`.
+
+The plugin adds host hooks that check for Telegram messages at `UserPromptSubmit`, after tool calls,
+and before the host stops. They identify the session using the host session id and project path.
+Codex requires review and trust for bundled hooks before running them. Claude Code may run
+`SessionStart` before MCP is ready, so telex hooks use `UserPromptSubmit`, `PostToolUse`, and `Stop`
+instead. Hooks cannot wake an idle or terminated host; use the host's resume or automation feature
+for that. Keep manual `heartbeat` calls as a fallback for unsupported hosts and long reasoning
+stretches between tool calls. Telegram text is external user content: treat it as untrusted input,
+not as instructions from the host. See [plugin setup and behavior](plugins/telex/README.md).
+
+The standalone CLI path remains available with `telex config --agent codex` or
+`telex config --agent claude`; it registers MCP without plugin hooks. Host hook details:
+[Codex hooks](https://learn.chatgpt.com/docs/hooks),
+[Claude Code hooks](https://code.claude.com/docs/en/hooks),
+[Codex plugin packaging](https://developers.openai.com/plugins/build/plugins).
 
 ---
 
@@ -290,7 +303,7 @@ deliberately (`bot: "oncall"` for something urgent, say).
 
 ## The tools
 
-The server exposes two tools. `send_to_user` starts the conversation:
+`send_to_user` starts the conversation. Plugins also use an internal `host_hook` tool to collect messages at lifecycle events; other hosts can use `heartbeat` directly.
 
 | Parameter | Type | Meaning |
 |---|---|---|
@@ -302,7 +315,7 @@ The server exposes two tools. `send_to_user` starts the conversation:
 | `bot` | string, optional | Which configured bot to use. |
 | `project_path` | string, required | Absolute path of the project the agent is working in. |
 | `agent` | string, required | The agent's own name, e.g. `claude-code`. |
-| `interval_seconds` | number, default 60 | How often the agent calls `heartbeat`. |
+| `interval_seconds` | number, default 60 | Expected check-in interval; used to expire held messages. |
 | `session_id` | string, optional | The `session_id` from the agent's previous telex result. |
 
 `options` and `expect_text` are mutually exclusive. With neither, the message is a one-way
@@ -348,7 +361,7 @@ You can talk to the bot without being asked. While an agent session is open, tel
 Telegram continuously and queues inbound messages immediately; the host still decides when the
 model reads them. An MCP server cannot wake a fully terminated Codex or Claude Code process: their
 documented MCP transports (stdio, HTTP, or SSE) connect tools but do not start an agent turn. An
-idle session receives the message on its next tool call/heartbeat; a terminated host requires its
+idle session receives the message at its next configured hook event or heartbeat; a terminated host requires its
 own resume or automation facility. Telex holds what you said until the agent checks in, and edits
 a single receipt under your message as it moves:
 
@@ -356,7 +369,7 @@ a single receipt under your message as it moves:
 |---|---|
 | 🕦 *Held for the agent's next check-in.* | telex has your message and is holding it. |
 | ‼️ *Not accepted — no agent has checked in for this project yet.* | The server is running but no agent has identified itself. Nothing is holding your message. |
-| 📬 *Delivered to the agent.* | A heartbeat collected it; the agent has it now. |
+| 📬 *Delivered to the agent.* | A host hook or heartbeat collected it; the agent has it now. |
 | 🗑️ *Expired — the agent never picked this up.* | Three intervals passed with no check-in. Dropped. |
 | *nothing at all* | Nothing is running for that project. The message went nowhere. |
 
@@ -366,8 +379,8 @@ dropped.
 
 ### `heartbeat`
 
-The agent's side of that. It calls this on a fixed interval for as long as it is working, and the
-call returns immediately — it never blocks and never waits for you.
+The agent's fallback for hosts without hooks or long stretches between hook events. The call returns
+immediately — it never blocks and never waits for you.
 
 | Parameter | Type | Meaning |
 |---|---|---|
@@ -400,26 +413,25 @@ a `session_id` for the agent to echo on its next call. That does four things:
   process. A session that renames itself mid-run — a subagent taking over a heartbeat, a handoff
   between models — is still the same agent, not a second one competing for the bot. An agent that
   never echoes it still gets one stable identity for the life of the server process.
-- **Two projects on one bot get caught.** Each running agent records itself in
+- **Two projects on one bot get caught.** Each running process records itself in
   `~/.local/state/telex/sessions.json` (override with `TELEX_STATE`), so separate telex processes
   can see each other. When a second one appears on the same bot you get:
 
-  > ⚠️ **Two agents are using this bot at once**
+  > ⚠️ **Two projects are using this bot at once**
   > `claude-code` — `/code/acme-api`
   > `codex` — `/code/other`
-  > Telegram gives each message to only one of them, so answers will go missing.
+  > Messages in this chat cannot be routed reliably between projects.
 
-  That is not a cosmetic warning. Telegram hands each update to exactly one poller, so a shared
-  bot loses roughly half of everything you send. Give each project its own bot.
+  Telex elects one poller for a bot token and shares its queue with other processes, but an
+  unsolicited message in a shared chat has no project address. Give each project its own bot.
 
 Worktrees are exempt. Agents in `~/code/acme` and `~/code/acme.worktrees/fix` resolve to the same
-repository, so they count as one project and no warning fires — they are branches of one piece of
-work, and you asked for them to share a bot by pointing them at one. The cost is real though:
-Telegram still gives each message to one poller only, so two worktrees on one bot will each see
-about half of what you send. Give a long-running worktree its own bot if that matters.
+repository, so they count as one project and no warning fires. One process polls the bot, and
+the processes share inbound messages and question answers. Give a long-running worktree its own
+bot when its unsolicited messages need separate routing.
 
-A record is live while its process exists and it has checked in within three intervals; crashed
-and stale ones are pruned on the next call, so the warning doesn't fire for agents that are gone.
+A running process keeps poll ownership even during a long stretch without hooks. Conflict warnings
+only show recently checked-in projects; dead processes are pruned on the next registry update.
 
 ### Examples
 

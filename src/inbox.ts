@@ -25,6 +25,17 @@ export type InboxStore = {
   receipt(key: string, messageId: number, receiptId: number): void;
 };
 
+/** Keep chats on separate bot tokens from collecting each other's messages. */
+export function scopedInbox(store: InboxStore, tokenKey: string): InboxStore {
+  const key = (chat: string) => `${tokenKey}:${chat}`;
+  return {
+    push: (chat, message, expiresAt) => store.push(key(chat), message, expiresAt),
+    take: (chat) => store.take(key(chat)),
+    expire: (chat, now) => store.expire(key(chat), now),
+    receipt: (chat, messageId, receiptId) => store.receipt(key(chat), messageId, receiptId),
+  };
+}
+
 /** An agent that never checks in must not grow the queue without bound; oldest go first. */
 const LIMIT = 50;
 

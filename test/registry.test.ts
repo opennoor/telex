@@ -150,6 +150,17 @@ test("ownership moves on when the owner stops running", (t) => {
   assert.equal(ownerOf("work"), SESSION, "a dead owner does not hold the bot");
 });
 
+test("a running owner keeps polling through a long gap between host hooks", (t) => {
+  isolated();
+  t.after(() => release(SESSION));
+  const stale = alive({ session_id: OTHER, agent: "owner", project: "/code/other", repo: "/code/other" });
+  stale.started_at = new Date(Date.now() - 600_000).toISOString();
+  stale.last_seen = stale.started_at;
+  writeFileSync(statePath(), JSON.stringify({ sessions: [stale] }));
+  touch(entry({ agent: "asker" }));
+  assert.equal(ownerOf("work"), OTHER, "sparse hooks do not create a second poller");
+});
+
 test("ownership is per bot", (t) => {
   isolated();
   t.after(() => release(SESSION));

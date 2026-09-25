@@ -1,0 +1,56 @@
+{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:telex:telex",
+            "tool": "host_hook",
+            "input": {
+              "event": "UserPromptSubmit",
+              "host_session_id": "${session_id}",
+              "project_path": "${cwd}",
+              "agent": "claude-code"
+            }
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:telex:telex",
+            "tool": "host_hook",
+            "input": {
+              "event": "PostToolUse",
+              "host_session_id": "${session_id}",
+              "project_path": "${cwd}",
+              "agent": "claude-code"
+            }
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "mcp_tool",
+            "server": "plugin:telex:telex",
+            "tool": "host_hook",
+            "input": {
+              "event": "Stop",
+              "host_session_id": "${session_id}",
+              "project_path": "${cwd}",
+              "agent": "claude-code",
+              "stop_hook_active": "${stop_hook_active}"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

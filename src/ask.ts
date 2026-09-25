@@ -1,4 +1,5 @@
 import { type BotSession, type CallbackCtx, type Incoming, TelegramError, escapeHtml, toTelegramHtml, fromMarkdown, stripHtml, MAX_MESSAGE_LEN } from "./telegram.ts";
+import { randomUUID } from "node:crypto";
 
 export type AskInput = {
   project: string;
@@ -15,8 +16,7 @@ export type AskResult =
   | { status: "answered"; response: string; kind: "choice" | "text"; message_id: number }
   | { status: "timeout"; message_id: number };
 
-let counter = 0;
-const nextRequestId = () => `${Date.now().toString(36)}${(counter++).toString(36)}`;
+const nextRequestId = () => randomUUID();
 
 /** Telegram truncates long inline-button labels, so long choices move into the body as a numbered list. */
 const LABEL_LIMIT = 24;
@@ -153,7 +153,7 @@ export function deliver(session: BotSession, chatId: number | string, now = Date
 
 /** An inline keyboard is clickable by anyone who can see it, so authorise the tap, not the send. */
 function authorized(ctx: CallbackCtx, chatId: number | string, allowFrom?: number[]) {
-  if (ctx.chatId !== undefined && String(ctx.chatId) !== String(chatId)) return false;
+  if (String(ctx.chatId) !== String(chatId)) return false;
   return !allowFrom?.length || (ctx.fromId !== undefined && allowFrom.includes(ctx.fromId));
 }
 
@@ -175,7 +175,7 @@ async function waitForAnswer(
         return;
       }
       resolve({ payload, ctx });
-    }),
+    }, deadline),
   );
   if (!tap) return null;
   const toast = (text: string) =>
@@ -191,20 +191,25 @@ async function waitForAnswer(
   const prompt = await send(session, chatId, "✍️ <i>Reply to this message with your response.</i>", [], {
     force_reply: true,
   });
-  const text = await until<string>(deadline, (resolve) =>
-    session.onText(chatId, (value, fromId) => {
-      if (allowFrom?.length && (fromId === undefined || !allowFrom.includes(fromId))) return;
-      resolve(value);
-    }),
-  );
-  await session.api("deleteMessage", { chat_id: chatId, message_id: prompt.message_id }).catch(() => {});
+  let text: string | null;
+  try {
+    text = await until<string>(deadline, (resolve) =>
+      session.onText(chatId, prompt.message_id, (value, fromId) => {
+        if (allowFrom?.length && (fromId === undefined || !allowFrom.includes(fromId))) return;
+        resolve(value);
+      }, deadline),
+    );
+  } finally {
+    await session.api("deleteMessage", { chat_id: chatId, message_id: prompt.message_id }).catch(() => {});
+  }
   return text === null ? null : { value: text, kind: "text" };
 }
 
 /** Resolve with the first value the subscriber emits, or null once the deadline passes. */
 function until<T>(deadline: number, subscribe: (resolve: (v: T) => void) => () => void): Promise<T | null> {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let done = false;
+    let unsubscribe = () => {};
     const finish = (v: T | null) => {
       if (done) return;
       done = true;
@@ -213,7 +218,13 @@ function until<T>(deadline: number, subscribe: (resolve: (v: T) => void) => () =
       resolve(v);
     };
     const timer = setTimeout(() => finish(null), Math.max(0, deadline - Date.now()));
-    const unsubscribe = subscribe((v) => finish(v));
+    try {
+      unsubscribe = subscribe((v) => finish(v));
+      if (done) unsubscribe();
+    } catch (err) {
+      clearTimeout(timer);
+      reject(err);
+    }
   });
 }
 

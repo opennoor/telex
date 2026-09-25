@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileInbox, memoryInbox, inboxPath } from "../src/inbox.ts";
+import { fileInbox, memoryInbox, scopedInbox, inboxPath } from "../src/inbox.ts";
 import type { Incoming } from "../src/telegram.ts";
 
 function isolated() {
@@ -34,6 +34,18 @@ test("a queue is per chat", () => {
 
   assert.deepEqual(store.take("9").map((m) => m.text), ["for nine"]);
   assert.deepEqual(store.take("7").map((m) => m.text), ["for seven"]);
+});
+
+test("two bots in one chat keep separate messages and receipts", () => {
+  isolated();
+  const shared = fileInbox();
+  const first = scopedInbox(shared, "token-a");
+  const second = scopedInbox(shared, "token-b");
+  first.push("7", said("for first"));
+  second.push("7", said("for second", 2));
+  first.receipt("7", 1, 555);
+  assert.deepEqual(second.take("7").map((m) => m.text), ["for second"]);
+  assert.deepEqual(first.take("7").map((m) => [m.text, m.receipt_id]), [["for first", 555]]);
 });
 
 test("nothing expires until a deadline was set for it", () => {

@@ -47,9 +47,56 @@ test("free-text reply is captured after the Reply button", async () => {
   await tick();
   assert.equal(last("sendMessage")!.params.reply_markup.force_reply, true);
 
-  session.dispatch({ update_id: 2, message: { message_id: 9, chat: { id: 7 }, text: "telex" } });
+  session.dispatch({ update_id: 2, message: { message_id: 9, chat: { id: 7 }, text: "telex", reply_to_message: { message_id: 102 } } });
   assert.deepEqual(await pending, { status: "answered", response: "telex", kind: "text", message_id: 101 });
   assert.equal(last("deleteMessage")!.params.message_id, 102);
+});
+
+test("plain text still answers when only one prompt is open", async () => {
+  const { session, calls } = fakeSession();
+  const pending = ask(session, 7, { project: "Telex", message: "Name?", expectText: true, timeoutSeconds: 5 });
+  await tick();
+  session.dispatch(callbackUpdate(calls[0].params.reply_markup.inline_keyboard[0][0].callback_data));
+  await tick();
+
+  session.dispatch({ update_id: 2, message: { message_id: 9, chat: { id: 7 }, text: "telex" } });
+  assert.deepEqual(await pending, { status: "answered", response: "telex", kind: "text", message_id: 101 });
+});
+
+test("text replying to another message stays in the inbox, then the prompt reply answers", async (t) => {
+  const { session, calls } = fakeSession();
+  t.after(() => session.stop());
+  watched(session);
+  const pending = ask(session, 7, { project: "Telex", message: "Name?", expectText: true, timeoutSeconds: 5 });
+  await tick();
+  session.dispatch(callbackUpdate(calls[0].params.reply_markup.inline_keyboard[0][0].callback_data));
+  await tick();
+
+  session.dispatch({ update_id: 2, message: { message_id: 9, chat: { id: 7 }, from: { id: 42 }, text: "unrelated", reply_to_message: { message_id: 999 } } });
+  await tick();
+  assert.deepEqual(session.take(7).map((m) => m.text), ["unrelated"]);
+  assert.equal(calls.filter((c) => c.method === "editMessageText").length, 0);
+
+  session.dispatch({ update_id: 3, message: { message_id: 10, chat: { id: 7 }, from: { id: 42 }, text: "answer", reply_to_message: { message_id: 102 } } });
+  assert.deepEqual(await pending, { status: "answered", response: "answer", kind: "text", message_id: 101 });
+});
+
+test("two text prompts in one chat keep their replies separate", async () => {
+  const { session, calls } = fakeSession();
+  const first = ask(session, 7, { project: "Telex", message: "First?", expectText: true, timeoutSeconds: 5 });
+  const second = ask(session, 7, { project: "Telex", message: "Second?", expectText: true, timeoutSeconds: 5 });
+  await tick();
+  const questions = calls.filter((c) => c.params.reply_markup?.inline_keyboard);
+  session.dispatch(callbackUpdate(questions[0].params.reply_markup.inline_keyboard[0][0].callback_data));
+  session.dispatch({ ...callbackUpdate(questions[1].params.reply_markup.inline_keyboard[0][0].callback_data), update_id: 2 });
+  await tick();
+  const prompts = calls.filter((c) => c.params.reply_markup?.force_reply);
+  assert.equal(prompts.length, 2);
+
+  session.dispatch({ update_id: 3, message: { message_id: 11, chat: { id: 7 }, text: "second", reply_to_message: { message_id: prompts[1].result.message_id } } });
+  session.dispatch({ update_id: 4, message: { message_id: 12, chat: { id: 7 }, text: "first", reply_to_message: { message_id: prompts[0].result.message_id } } });
+  assert.deepEqual(await first, { status: "answered", response: "first", kind: "text", message_id: 101 });
+  assert.deepEqual(await second, { status: "answered", response: "second", kind: "text", message_id: 102 });
 });
 
 test("no answer before the deadline marks the message stale", async () => {
@@ -80,6 +127,19 @@ test("a tap from an unlisted user is rejected and the question stays open", asyn
   assert.equal(last("editMessageText"), undefined);
 
   session.dispatch({ ...callbackUpdate(data, 42), update_id: 2 });
+  assert.equal((await pending).status, "answered");
+});
+
+test("a callback without the question's chat cannot answer", async () => {
+  const { session, calls } = fakeSession();
+  const pending = ask(session, 7, { project: "Telex", message: "Deploy?", options: ["Yes"], timeoutSeconds: 5 });
+  await tick();
+  const data = calls[0].params.reply_markup.inline_keyboard[0][0].callback_data;
+  session.dispatch({ ...callbackUpdate(data), callback_query: { id: "missing", data, from: { id: 42 } } });
+  session.dispatch({ ...callbackUpdate(data, 42, 8), update_id: 2 });
+  await tick();
+  assert.equal(calls.filter((c) => c.method === "editMessageText").length, 0);
+  session.dispatch({ ...callbackUpdate(data), update_id: 3 });
   assert.equal((await pending).status, "answered");
 });
 

@@ -1,9 +1,10 @@
 /** Thin Telegram Bot API client plus an on-demand long-poll loop per bot token. */
 import { memoryInbox, type InboxStore } from "./inbox.ts";
+import { callbackKey, textKey, type AnswerStore } from "./answers.ts";
 
 export type Update = {
   update_id: number;
-  message?: { message_id: number; chat: { id: number }; from?: { id: number }; text?: string };
+  message?: { message_id: number; chat: { id: number }; from?: { id: number }; text?: string; reply_to_message?: { message_id: number } };
   callback_query?: {
     id: string;
     data?: string;
@@ -12,7 +13,7 @@ export type Update = {
   };
 };
 
-export type Fetcher = (method: string, params: Record<string, unknown>) => Promise<any>;
+export type Fetcher = (method: string, params: Record<string, unknown>, signal?: AbortSignal) => Promise<any>;
 
 export class TelegramError extends Error {
   method: string;
@@ -30,13 +31,14 @@ export class TelegramError extends Error {
 export const redactToken = (s: string, token: string) => (token ? s.split(token).join("<token>") : s);
 
 export function apiFor(token: string): Fetcher {
-  return async function call(method, params, attempt = 0): Promise<any> {
+  return async function call(method, params, signal, attempt = 0): Promise<any> {
     let body: { ok: boolean; result?: unknown; description?: string; parameters?: { retry_after?: number } };
     try {
       const res = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(params),
+        signal,
       });
       body = (await res.json()) as typeof body;
     } catch (err) {
@@ -46,7 +48,7 @@ export function apiFor(token: string): Fetcher {
     const retryAfter = body.parameters?.retry_after;
     if (retryAfter !== undefined && attempt < 2) {
       await new Promise((r) => setTimeout(r, (retryAfter + 1) * 1000));
-      return call(method, params, attempt + 1);
+      return call(method, params, signal, attempt + 1);
     }
     throw new TelegramError(method, redactToken(body.description ?? "unknown error", token), 0);
   } as Fetcher;
@@ -136,8 +138,15 @@ export class BotSession {
   private offset = 0;
   private backlogSkipped = false;
   private looping = false;
+  private pollAbort?: AbortController;
   private callbackWaiters = new Map<string, CallbackWaiter>();
   private textWaiters = new Map<string, TextWaiter>();
+  private callbackDeadlines = new Map<string, number>();
+  private textDeadlines = new Map<string, number>();
+  private answerStore?: AnswerStore;
+  private answerTimer?: ReturnType<typeof setInterval>;
+  private remoteKeys = new Set<string>();
+  private pollingOwner = true;
   private watched = new Map<string, Watch>();
   /** Where queued messages live. Shared across processes in the server; private in tests. */
   private store: InboxStore = memoryInbox();
@@ -149,16 +158,73 @@ export class BotSession {
     this.pollTimeout = pollTimeout;
   }
 
-  onCallback(requestId: string, fn: CallbackWaiter): () => void {
-    this.callbackWaiters.set(requestId, fn);
-    this.ensureLoop();
-    return () => this.callbackWaiters.delete(requestId);
+  setAnswerStore(store: AnswerStore) {
+    this.answerStore = store;
+    const offset = store.offset();
+    if (offset !== undefined) {
+      this.offset = Math.max(this.offset, offset);
+      this.backlogSkipped = true;
+    }
   }
 
-  onText(chatId: number | string, fn: TextWaiter): () => void {
-    this.textWaiters.set(String(chatId), fn);
-    this.ensureLoop();
-    return () => this.textWaiters.delete(String(chatId));
+  /** Only the elected process may call getUpdates; other processes read shared answer events. */
+  setPollingOwner(owns: boolean) {
+    if (!owns && !this.answerStore) throw new Error("telex: shared answer store is required for a non-owner session");
+    if (this.pollingOwner === owns) return;
+    this.pollingOwner = owns;
+    if (!owns) this.pollAbort?.abort();
+    if (owns && this.answerStore?.hasQuestions()) this.backlogSkipped = true;
+    for (const [id, deadline] of this.callbackDeadlines) {
+      const key = callbackKey(id);
+      if (!owns && !this.remoteKeys.has(key)) {
+        this.answerStore?.register(key, deadline);
+        this.remoteKeys.add(key);
+      }
+    }
+    for (const [key, deadline] of this.textDeadlines) {
+      if (!owns && !this.remoteKeys.has(key)) {
+        this.answerStore?.register(key, deadline);
+        this.remoteKeys.add(key);
+      }
+    }
+    if (owns) {
+      if (this.listening || !this.idle) this.ensureLoop();
+    }
+    this.ensureAnswerLoop();
+  }
+
+  onCallback(requestId: string, fn: CallbackWaiter, deadline: number): () => void {
+    const key = callbackKey(requestId);
+    if (!this.pollingOwner) {
+      this.answerStore!.register(key, deadline);
+      this.remoteKeys.add(key);
+    }
+    this.callbackWaiters.set(requestId, fn);
+    this.callbackDeadlines.set(requestId, deadline);
+    if (this.pollingOwner) this.ensureLoop();
+    else this.ensureAnswerLoop();
+    return () => {
+      this.callbackWaiters.delete(requestId);
+      this.callbackDeadlines.delete(requestId);
+      if (this.remoteKeys.delete(key)) this.answerStore?.remove(key);
+    };
+  }
+
+  onText(chatId: number | string, promptId: number, fn: TextWaiter, deadline: number): () => void {
+    const key = textKey(chatId, promptId);
+    if (!this.pollingOwner) {
+      this.answerStore!.register(key, deadline);
+      this.remoteKeys.add(key);
+    }
+    this.textWaiters.set(key, fn);
+    this.textDeadlines.set(key, deadline);
+    if (this.pollingOwner) this.ensureLoop();
+    else this.ensureAnswerLoop();
+    return () => {
+      this.textWaiters.delete(key);
+      this.textDeadlines.delete(key);
+      if (this.remoteKeys.delete(key)) this.answerStore?.remove(key);
+    };
   }
 
   /**
@@ -210,9 +276,36 @@ export class BotSession {
   }
 
   private ensureLoop() {
-    if (this.looping) return;
+    if (!this.pollingOwner || this.looping) return;
     this.looping = true;
-    void this.loop().finally(() => (this.looping = false));
+    void this.loop().finally(() => {
+      this.looping = false;
+      if (this.pollingOwner && (this.listening || !this.idle)) this.ensureLoop();
+    });
+  }
+
+  private ensureAnswerLoop() {
+    if (!this.answerStore || this.answerTimer || this.remoteKeys.size === 0) return;
+    // ponytail: one 50ms filesystem poll per process; use IPC if question volume grows.
+    this.answerTimer = setInterval(() => {
+      if (this.remoteKeys.size === 0) {
+        clearInterval(this.answerTimer);
+        this.answerTimer = undefined;
+        return;
+      }
+      for (const [id, fn] of this.callbackWaiters) {
+        if (!this.remoteKeys.has(callbackKey(id))) continue;
+        for (const event of this.answerStore!.take(callbackKey(id))) {
+          if (event.kind === "callback") fn(event.payload, event.ctx);
+        }
+      }
+      for (const [key, fn] of this.textWaiters) {
+        if (!this.remoteKeys.has(key)) continue;
+        for (const event of this.answerStore!.take(key)) {
+          if (event.kind === "text") fn(event.text, event.fromId);
+        }
+      }
+    }, 50);
   }
 
   /**
@@ -222,21 +315,29 @@ export class BotSession {
   private async skipBacklog() {
     if (this.backlogSkipped) return;
     this.backlogSkipped = true;
-    const updates: Update[] = await this.api("getUpdates", { offset: -1, timeout: 0 }).catch(() => []);
+    const controller = new AbortController();
+    this.pollAbort = controller;
+    const updates: Update[] = await this.api("getUpdates", { offset: -1, timeout: 0 }, controller.signal).catch(() => []);
+    if (this.pollAbort === controller) this.pollAbort = undefined;
+    if (!this.pollingOwner) return;
     for (const u of updates) this.offset = Math.max(this.offset, u.update_id + 1);
+    this.answerStore?.saveOffset(this.offset);
   }
 
   private async loop() {
     await this.skipBacklog();
-    while (this.listening || !this.idle) {
+    while (this.pollingOwner && (this.listening || !this.idle)) {
       let updates: Update[];
+      const controller = new AbortController();
+      this.pollAbort = controller;
       try {
         updates = await this.api("getUpdates", {
           offset: this.offset,
           timeout: this.pollTimeout,
           allowed_updates: ["message", "callback_query"],
-        });
+        }, controller.signal);
       } catch (err) {
+        if (!this.pollingOwner) break;
         if (isPollingConflict(err)) {
           process.stderr.write(
             "telex: getUpdates conflict — another process is polling this bot token. " +
@@ -245,7 +346,10 @@ export class BotSession {
         }
         await new Promise((r) => setTimeout(r, 1000));
         continue;
+      } finally {
+        if (this.pollAbort === controller) this.pollAbort = undefined;
       }
+      if (!this.pollingOwner) break;
       for (const u of updates) this.dispatch(u);
       this.sweepInbox();
     }
@@ -254,22 +358,41 @@ export class BotSession {
   /** Exposed for tests: route one update to whoever is waiting for it. */
   dispatch(u: Update) {
     this.offset = Math.max(this.offset, u.update_id + 1);
+    this.route(u);
+    if (this.pollingOwner) this.answerStore?.saveOffset(this.offset);
+  }
+
+  private route(u: Update) {
     const cq = u.callback_query;
     if (cq?.data?.startsWith("telex:")) {
       const [, requestId, payload] = cq.data.split(":");
-      this.callbackWaiters.get(requestId)?.(payload ?? "", {
+      const ctx = {
         callbackId: cq.id,
         fromId: cq.from?.id,
         chatId: cq.message?.chat.id,
-      });
+      };
+      const waiter = this.callbackWaiters.get(requestId);
+      if (waiter) waiter(payload ?? "", ctx);
+      else this.answerStore?.callback(requestId, payload ?? "", ctx);
       return;
     }
     const msg = u.message;
     // Slash commands stay available to whatever else the user runs against this bot.
     if (msg?.text === undefined || msg.text.startsWith("/")) return;
     const key = String(msg.chat.id);
-    const answering = this.textWaiters.get(key);
-    if (answering) return answering(msg.text, msg.from?.id);
+    if (msg.reply_to_message) {
+      const answering = this.textWaiters.get(textKey(key, msg.reply_to_message.message_id));
+      if (answering) return answering(msg.text, msg.from?.id);
+      if (this.answerStore?.text(key, msg.reply_to_message.message_id, msg.text, msg.from?.id)) return;
+    } else {
+      // ponytail: bare text may answer an unrelated lone prompt; require reply metadata once clients reliably supply it.
+      const waiting = [...this.textWaiters].filter(([candidate]) => candidate.startsWith(`t-${key}-`));
+      const remote = this.answerStore?.textKeys(key) ?? [];
+      if (new Set([...waiting.map(([candidate]) => candidate), ...remote]).size === 1) {
+        if (waiting.length) return waiting[0][1](msg.text, msg.from?.id);
+        if (this.answerStore?.text(key, undefined, msg.text, msg.from?.id)) return;
+      }
+    }
     this.queue(key, msg);
   }
 
