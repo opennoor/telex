@@ -46,6 +46,7 @@ test("host plugins register one MCP server and one explicit hook file", () => {
           host_session_id: "${session_id}",
           project_path: "${cwd}",
           agent,
+          ...(host === "codex" && event === "UserPromptSubmit" ? { prompt: "${prompt}" } : {}),
           ...(event === "Stop" ? { stop_hook_active: "${stop_hook_active}" } : {}),
         },
       });

@@ -13,7 +13,7 @@ import { statePath } from "./registry.ts";
 import type { Incoming } from "./telegram.ts";
 
 /** A queued message plus the deadline the queueing process gave it. */
-export type Held = Incoming & { key: string; expires_at?: number };
+export type Held = Incoming & { key: string; expires_at?: number; wake_claim?: string };
 
 /** What a BotSession needs of a queue, so tests can keep using a plain in-memory one. */
 export type InboxStore = {
@@ -23,6 +23,12 @@ export type InboxStore = {
   expire(key: string, now: number): Incoming[];
   /** Record telex's reply to a message, so any process can settle that receipt later. */
   receipt(key: string, messageId: number, receiptId: number): void;
+  /** Reserve one message durably before any terminal input. A claim is never replayed. */
+  claim(key: string, id: string, accept: (message: Incoming) => boolean): Incoming | undefined;
+  /** Remove only the message confirmed by the matching host prompt hook. */
+  ack(key: string, id: string): Incoming | undefined;
+  claimed(key: string): Incoming[];
+  resolve(key: string, messageId: number, retry: boolean): Incoming | undefined;
 };
 
 /** Keep chats on separate bot tokens from collecting each other's messages. */
@@ -33,6 +39,10 @@ export function scopedInbox(store: InboxStore, tokenKey: string): InboxStore {
     take: (chat) => store.take(key(chat)),
     expire: (chat, now) => store.expire(key(chat), now),
     receipt: (chat, messageId, receiptId) => store.receipt(key(chat), messageId, receiptId),
+    claim: (chat, id, accept) => store.claim(key(chat), id, accept),
+    ack: (chat, id) => store.ack(key(chat), id),
+    claimed: (chat) => store.claimed(key(chat)),
+    resolve: (chat, messageId, retry) => store.resolve(key(chat), messageId, retry),
   };
 }
 
@@ -72,13 +82,24 @@ function withLock<T>(fn: () => T): T {
   let held = false;
   while (Date.now() < deadline) {
     try {
-      closeSync(openSync(lock, "wx"));
+      const fd = openSync(lock, "wx");
       held = true;
+      try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
       break;
-    } catch {
+    } catch (err) {
+      if (held) {
+        try { unlinkSync(lock); } catch { /* failed acquisition already owns no data */ }
+        throw err;
+      }
       // A lock left behind by a crash must not wedge every agent on the machine.
       try {
-        if (Date.now() - statSync(lock).mtimeMs > 10_000) unlinkSync(lock);
+        if (Date.now() - statSync(lock).mtimeMs > 10_000) {
+          const owner = Number(readFileSync(lock, "utf8"));
+          let alive = false;
+          try { if (owner > 0) { process.kill(owner, 0); alive = true; } }
+          catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; }
+          if (!alive) unlinkSync(lock);
+        }
       } catch {
         // it went away on its own
       }
@@ -86,42 +107,40 @@ function withLock<T>(fn: () => T): T {
       while (Date.now() < until);
     }
   }
+  if (!held) throw new Error("telex: inbox lock timed out");
   try {
     return fn();
   } finally {
-    if (held) {
-      try {
-        unlinkSync(lock);
-      } catch {
-        // already gone
-      }
-    }
+    try { unlinkSync(lock); } catch { /* already gone */ }
   }
 }
 
 /** The queue every telex process on this machine shares. */
 export function fileInbox(): InboxStore {
-  const strip = ({ key: _key, expires_at: _expires, ...message }: Held): Incoming => message;
+  const strip = ({ key: _key, expires_at: _expires, wake_claim: _claim, ...message }: Held): Incoming => message;
   return {
     push(key, message, expiresAt) {
       withLock(() => {
-        const held = read().filter((m) => !(m.key === key && m.message_id === message.message_id));
+        const existing = read();
+        if (existing.some((m) => m.key === key && m.message_id === message.message_id && m.wake_claim)) return;
+        const held = existing.filter((m) => !(m.key === key && m.message_id === message.message_id));
         const mine = held.filter((m) => m.key === key);
         const others = held.filter((m) => m.key !== key);
-        write([...others, ...[...mine, { ...message, key, expires_at: expiresAt }].slice(-LIMIT)]);
+        const pending = [...mine.filter((m) => !m.wake_claim), { ...message, key, expires_at: expiresAt }].slice(-LIMIT);
+        write([...others, ...mine.filter((m) => m.wake_claim), ...pending]);
       });
     },
     take(key) {
       return withLock(() => {
         const held = read();
-        write(held.filter((m) => m.key !== key));
-        return held.filter((m) => m.key === key).map(strip);
+        write(held.filter((m) => m.key !== key || m.wake_claim));
+        return held.filter((m) => m.key === key && !m.wake_claim).map(strip);
       });
     },
     expire(key, now) {
       return withLock(() => {
         const held = read();
-        const dead = held.filter((m) => m.key === key && m.expires_at !== undefined && now > m.expires_at);
+        const dead = held.filter((m) => m.key === key && !m.wake_claim && m.expires_at !== undefined && now > m.expires_at);
         if (dead.length) write(held.filter((m) => !dead.includes(m)));
         return dead.map(strip);
       });
@@ -135,6 +154,40 @@ export function fileInbox(): InboxStore {
         write(held);
       });
     },
+    claim(key, id, accept) {
+      return withLock(() => {
+        const held = read();
+        if (held.some((m) => m.key === key && m.wake_claim)) return undefined;
+        const found = held.find((m) => m.key === key && !m.wake_claim &&
+          (m.expires_at === undefined || Date.now() <= m.expires_at) && accept(strip(m)));
+        if (!found) return undefined;
+        found.wake_claim = id;
+        write(held);
+        return strip(found);
+      });
+    },
+    ack(key, id) {
+      return withLock(() => {
+        const held = read();
+        const found = held.find((m) => m.key === key && m.wake_claim === id);
+        if (!found) return undefined;
+        write(held.filter((m) => m !== found));
+        return strip(found);
+      });
+    },
+    claimed(key) {
+      return withLock(() => read().filter((m) => m.key === key && m.wake_claim).map(strip));
+    },
+    resolve(key, messageId, retry) {
+      return withLock(() => {
+        const held = read();
+        const found = held.find((m) => m.key === key && m.message_id === messageId && m.wake_claim);
+        if (!found) return undefined;
+        if (retry) { delete found.wake_claim; delete found.expires_at; }
+        write(retry ? held : held.filter((m) => m !== found));
+        return strip(found);
+      });
+    },
   };
 }
 
@@ -142,24 +195,54 @@ export function fileInbox(): InboxStore {
 export function memoryInbox(): InboxStore {
   // Holds the very object it was handed: callers stamp a receipt id onto a queued message after
   // Telegram answers, and a copy would silently lose it.
-  const held = new Map<string, { message: Incoming; expiresAt?: number }[]>();
+  const held = new Map<string, { message: Incoming & { wake_claim?: string }; expiresAt?: number }[]>();
   return {
     push(key, message, expiresAt) {
-      held.set(key, [...(held.get(key) ?? []), { message, expiresAt }].slice(-LIMIT));
+      const queued = held.get(key) ?? [];
+      if (queued.some((entry) => entry.message.message_id === message.message_id && entry.message.wake_claim)) return;
+      const claimed = queued.filter((entry) => entry.message.wake_claim);
+      const pending = queued.filter((entry) => !entry.message.wake_claim && entry.message.message_id !== message.message_id);
+      held.set(key, [...claimed, ...[...pending, { message, expiresAt }].slice(-LIMIT)]);
     },
     take(key) {
       const queued = held.get(key) ?? [];
-      held.delete(key);
-      return queued.map((entry) => entry.message);
+      held.set(key, queued.filter((entry) => entry.message.wake_claim));
+      return queued.filter((entry) => !entry.message.wake_claim).map((entry) => entry.message);
     },
     expire(key, now) {
       const queued = held.get(key) ?? [];
-      const dead = queued.filter((entry) => entry.expiresAt !== undefined && now > entry.expiresAt);
+      const dead = queued.filter((entry) => !entry.message.wake_claim && entry.expiresAt !== undefined && now > entry.expiresAt);
       if (dead.length) held.set(key, queued.filter((entry) => !dead.includes(entry)));
       return dead.map((entry) => entry.message);
     },
     receipt() {
       // Nothing to do: the caller already holds the object it queued.
+    },
+    claim(key, id, accept) {
+      const queued = held.get(key) ?? [];
+      if (queued.some((entry) => entry.message.wake_claim)) return undefined;
+      const found = queued.find((entry) => accept(entry.message));
+      if (!found) return undefined;
+      found.message.wake_claim = id;
+      return found.message;
+    },
+    ack(key, id) {
+      const queued = held.get(key) ?? [];
+      const found = queued.find((entry) => entry.message.wake_claim === id);
+      if (!found) return undefined;
+      held.set(key, queued.filter((entry) => entry !== found));
+      return found.message;
+    },
+    claimed(key) {
+      return (held.get(key) ?? []).filter((entry) => entry.message.wake_claim).map((entry) => entry.message);
+    },
+    resolve(key, messageId, retry) {
+      const queued = held.get(key) ?? [];
+      const found = queued.find((entry) => entry.message.message_id === messageId && entry.message.wake_claim);
+      if (!found) return undefined;
+      if (retry) { delete found.message.wake_claim; found.expiresAt = undefined; }
+      else held.set(key, queued.filter((entry) => entry !== found));
+      return found.message;
     },
   };
 }

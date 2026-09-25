@@ -271,6 +271,14 @@ export class BotSession {
     this.store.receipt(String(chatId), messageId, receiptId);
   }
 
+  claimForWake(chatId: number | string, id: string, accept: (message: Incoming) => boolean) {
+    return this.store.claim(String(chatId), id, accept);
+  }
+
+  ackWake(chatId: number | string, id: string) {
+    return this.store.ack(String(chatId), id);
+  }
+
   private get idle() {
     return this.callbackWaiters.size === 0 && this.textWaiters.size === 0;
   }

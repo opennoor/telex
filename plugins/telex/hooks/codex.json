@@ -10,6 +10,7 @@
             "input": {
               "event": "UserPromptSubmit",
               "host_session_id": "${session_id}",
+              "prompt": "${prompt}",
               "project_path": "${cwd}",
               "agent": "codex"
             }

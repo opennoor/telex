@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.6.0        # pin an exact published version
+npm i -g @sojaner/telex@0.7.0        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -355,8 +355,9 @@ You can talk to the bot without being asked. While an agent session is open, tel
 Telegram continuously and queues inbound messages immediately; the host still decides when the
 model reads them. An MCP server cannot wake a fully terminated Codex or Claude Code process: their
 documented MCP transports (stdio, HTTP, or SSE) connect tools but do not start an agent turn. An
-idle session receives the message at its next configured hook event or heartbeat; a terminated host requires its
-own resume or automation facility. Telex holds what you said until the agent checks in, and edits
+idle session receives the message at its next configured hook event or heartbeat, unless the optional
+Codex tmux wake mode below is enabled. A terminated host requires its own resume or automation facility.
+Telex holds what you said until the agent checks in, and edits
 a single receipt under your message as it moves:
 
 | What you see | What it means |
@@ -370,6 +371,50 @@ a single receipt under your message as it moves:
 Silence is the signal: telex only polls while its process is alive, so a message with no receipt
 at all means no agent is there to receive it. Held messages are capped at 50 per chat, oldest
 dropped.
+
+#### Wake an idle Codex conversation in tmux
+
+Telex can submit a Telegram message to **the same running Codex CLI conversation** after its turn
+finishes. This is off by default. It requires the Codex plugin hooks, a bot with a nonempty
+`allowFrom` list, Linux `/proc`, and a dedicated tmux pane running `codex` directly. The pane must
+be detached before enrollment and remain detached while wake is enabled; Telex will not type into
+an attached pane, a draft, copy mode, an approval screen, or a pane whose process changed.
+
+After Codex has finished a turn, note its pane ID and socket path, detach that tmux session
+(normally `Ctrl-b d`), then run from another terminal:
+
+```sh
+tmux -S /absolute/tmux/socket list-panes -a -F '#{pane_id} #{pane_pid} #{pane_current_command}'
+telex wake bind %12 --socket /absolute/tmux/socket
+```
+
+Use the actual `%` pane ID; `telex wake bind` records its tmux session, PID and process start time
+in the private state file and the already-running Telex MCP server picks it up. The last idle
+`Stop` hook must be at most ten minutes old. If it is older, finish another Codex turn and bind
+after it stops. No new Codex thread is created. `telex wake disable` removes the binding; attach
+only after disabling wake.
+
+Telex waits for an empty Codex prompt, then pastes one physical line containing the Telegram
+message as a JSON string and presses Enter. This preserves Unicode and multiline text without
+letting embedded line breaks become extra terminal submissions. It rechecks the sender against
+`allowFrom`, the exact pane and process, and detachment before input. `Stop` is a turn-end hint,
+not a terminal readiness guarantee; an unrecognized Codex screen stays held for the next hook or
+heartbeat. Messages too long to fit on one visible prompt line also stay in the normal queue.
+Telex claims a message durably before terminal input and marks it submitted only when
+Codex's matching `UserPromptSubmit` hook arrives. A crash or ambiguous submission is never
+automatically replayed.
+
+If a receipt remains at “Submitting to Codex,” disable wake, inspect the pane, and list the claims:
+
+```sh
+telex wake disable
+telex wake pending
+telex wake recover 123 --delivered  # only if Codex accepted that message
+telex wake recover 123 --retry      # only if it did not; choose one action
+```
+
+Recovery updates the Telegram receipt and either removes the confirmed claim or returns the
+message to the normal queue. Rebind the detached pane after recovery if you want wake again.
 
 ### `heartbeat`
 

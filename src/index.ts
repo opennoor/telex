@@ -11,6 +11,7 @@ import { fileAnswers } from "./answers.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { hookOutput, hostSessionId } from "./host.ts";
+import { Wake, wakeTargetFromConfig, type WakeTarget } from "./wake.ts";
 
 const config = loadConfig();
 const botNames = Object.keys(config.bots);
@@ -28,6 +29,24 @@ let activeSession: string = randomUUID();
  * by an agent that is not the one checking in.
  */
 const shared = fileInbox();
+let wake: Wake | undefined;
+let wakeTarget: WakeTarget | undefined;
+let lastIdleStop: { hostId: string; at: number } | undefined;
+
+/** A local config file can enroll this already-running Codex conversation after detachment. */
+function reconcileWake(bot: Bot) {
+  let target: WakeTarget | undefined;
+  try { target = wakeTargetFromConfig(); } catch { /* stale or unsafe binding: stay disabled */ }
+  if (JSON.stringify(target) !== JSON.stringify(wakeTarget)) {
+    wake?.stop();
+    wake = undefined;
+    wakeTarget = target;
+  }
+  if (!wake && target && bot.allowFrom?.length && lastIdleStop && Date.now() - lastIdleStop.at < 10 * 60_000) {
+    wake = new Wake(target, bot, sessionFor(bot.token));
+    wake.onHook("Stop", lastIdleStop.hostId, [], false);
+  }
+}
 
 function bind(bot: Bot): BotSession {
   const session = sessionFor(bot.token);
@@ -85,7 +104,7 @@ function monitor(bot: Bot) {
   const key = pollKey(bot);
   if (monitoredBots.has(key)) return;
   monitoredBots.set(key, bot);
-  setInterval(() => claim(bot, registrationId(bot)), 1000).unref();
+  setInterval(() => { claim(bot, registrationId(bot)); reconcileWake(bot); }, 1000).unref();
 }
 
 const warned = new Set<string>();
@@ -264,15 +283,20 @@ server.registerTool(
       project_path: identity.project_path,
       agent: identity.agent,
       stop_hook_active: z.union([z.boolean(), z.enum(["true", "false"]).transform((value) => value === "true")]).optional(),
+      prompt: z.string().optional(),
     },
   },
-  async ({ event, host_session_id, project_path, agent, stop_hook_active }) => {
+  async ({ event, host_session_id, project_path, agent, stop_hook_active, prompt }) => {
     const { bot } = pickBot(config);
     const { session } = checkIn(bot, {
       project_path, agent, interval_seconds: 60, session_id: hostSessionId(agent, host_session_id, processSession),
     });
     // A second Stop continuation must not consume a new message that it cannot pass to the model.
     const messages = event === "Stop" && stop_hook_active ? [] : heartbeat(session, bot.chatId);
+    lastIdleStop = event === "Stop" && agent === "codex" && !stop_hook_active && messages.length === 0
+      ? { hostId: host_session_id, at: Date.now() } : undefined;
+    reconcileWake(bot);
+    wake?.onHook(event, host_session_id, messages, stop_hook_active, prompt);
     return json(hookOutput(event, messages));
   },
 );
