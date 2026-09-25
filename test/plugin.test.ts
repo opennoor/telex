@@ -20,6 +20,7 @@ test("both host marketplaces install the bundled telex plugin", () => {
 
 test("host plugins register one MCP server and one explicit hook file", () => {
   const mcp = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8"));
+  const packageVersion = JSON.parse(readFileSync(join(process.cwd(), "package.json"), "utf8")).version;
   assert.deepEqual(Object.keys(mcp.mcpServers), ["telex"]);
   assert.equal(existsSync(join(root, "hooks/hooks.json")), false);
 
@@ -28,6 +29,7 @@ test("host plugins register one MCP server and one explicit hook file", () => {
     ["claude", "plugin:telex:telex", "claude-code", ".claude-plugin/plugin.json"],
   ]) {
     const manifest = JSON.parse(readFileSync(join(root, manifestPath), "utf8"));
+    assert.equal(manifest.version, packageVersion, `${host} plugin must refresh with the npm release`);
     const hookPath = `./hooks/${host}.json`;
     assert.equal(manifest.mcpServers, "./.mcp.json");
     assert.equal(manifest.hooks, hookPath);

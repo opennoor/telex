@@ -210,7 +210,7 @@ async function wakeCommand(action?: string) {
     });
     if (!hostedHere) throw new Error(
       "wake needs a recently checked-in Telex MCP process under this Codex pane. " +
-      "Default daemon-hosted Codex cannot bind. Install Telex v0.7.1, then resume this saved " +
+      "Default daemon-hosted Codex cannot bind. Install the current Telex release, then resume this saved " +
       "conversation with `exec codex --no-daemon resume <session-id>`, finish a turn, detach, and bind."
     );
     const config = { socket: flags.socket, session, pane, pid, start: processStart(pid) };

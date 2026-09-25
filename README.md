@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.7.1        # pin an exact published version
+npm i -g @sojaner/telex@0.7.2        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -382,13 +382,20 @@ Codex mode cannot be bound: Telex cannot prove that its MCP process belongs to t
 must be detached before enrollment and remain detached while wake is enabled; Telex will not type
 into an attached pane, a draft, copy mode, an approval screen, or a pane whose process changed.
 
-For a conversation already running in the default daemon mode, first install the new Telex version
-and check `telex list` for your bot's nonempty `allow` IDs. Run `/status` in Codex and note its
-Session UUID, then exit that Codex process. If its tmux pane returns to a shell, resume its
-**saved conversation** there:
+For a conversation already running in the default daemon mode, install the new Telex package and
+Codex plugin from another terminal, then check that `telex list` shows nonempty `allow` IDs for
+your bot:
 
 ```sh
-npm i -g @sojaner/telex@0.7.1
+npm i -g @sojaner/telex@0.7.2
+telex install codex
+telex list
+```
+
+Run `/status` in Codex and note its Session UUID, then exit that Codex process. If its tmux pane
+returns to a shell, resume its **saved conversation** there:
+
+```sh
 exec codex --no-daemon resume <session-id>
 ```
 
@@ -396,7 +403,7 @@ exec codex --no-daemon resume <session-id>
 server; installing the package cannot reload an already-running MCP process. `exec` makes Codex
 the pane process rather than leaving a shell underneath it. If the old pane closed on exit, create
 a new dedicated tmux pane and run the same `exec codex --no-daemon resume <session-id>` command in
-it. Finish a new turn so the v0.7.1 Telex server sees a fresh `Stop` hook, then detach. On a new
+it. Finish a new turn so the v0.7.2 Telex server sees a fresh `Stop` hook, then detach. On a new
 conversation, start it directly with
 `exec codex --no-daemon` and likewise finish a turn before binding.
 
