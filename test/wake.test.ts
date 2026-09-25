@@ -20,6 +20,8 @@ const message = (id: number, text: string, from_id = 7, receipt_id = 100 + id): 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 async function fixture() {
+  // Node 24 names its main thread `MainThread` even when launched through a `codex` symlink.
+  process.title = "codex";
   const dir = process.env.TELEX_WAKE_FIXTURE_DIR!;
   const socket = join(dir, "socket");
   const session = "wake_test";
