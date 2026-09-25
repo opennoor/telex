@@ -1,0 +1,8 @@
+{
+  "name": "telex",
+  "description": "Telegram relay for local AI agents",
+  "owner": { "name": "Sojaner" },
+  "plugins": [
+    { "name": "telex", "source": "./telex" }
+  ]
+}

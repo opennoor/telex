@@ -1,6 +1,6 @@
 {
   "name": "telex",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Bidirectional Telegram relay for Codex agent sessions.",
   "author": {
     "name": "Sojaner",

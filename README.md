@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.5.0        # pin an exact published version
+npm i -g @sojaner/telex@0.5.1        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -53,10 +53,11 @@ Upgrade with the same install command; uninstall with `npm rm -g @sojaner/telex`
 
 ### Codex and Claude plugins
 
-This repository also contains a plugin for Codex and Claude Code. Install telex first, then install
-the `plugins/telex` directory from this checkout (or an unpacked published package) with the host's
-plugin installer. In each project, run `telex add` and `telex project <name>` to choose a bot. The
-plugin contains no bot tokens and keeps the MCP registration in `plugins/telex/.mcp.json`.
+This repository also contains a plugin for Codex and Claude Code. After installing the global
+`telex` command, run `telex install`: it asks which host to install into and registers the bundled
+plugin through that host's marketplace. Use `telex install codex` or `telex install claude` in a
+script. In each project, run `telex add` and `telex project <name>` to choose a bot. The plugin
+contains no bot tokens and keeps its MCP registration in `plugins/telex/.mcp.json`.
 
 The plugin adds host hooks that check for Telegram messages at `UserPromptSubmit`, after tool calls,
 and before the host stops. They identify the session using the host session id and project path.

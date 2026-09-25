@@ -1,6 +1,6 @@
 {
   "name": "@sojaner/telex",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Telegram relay plugin and MCP server for local AI agents",
   "type": "module",
   "bin": {

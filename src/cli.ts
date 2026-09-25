@@ -1,6 +1,10 @@
 #!/usr/bin/env node
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { fileURLToPath } from "node:url";
+import { execFileSync } from "node:child_process";
+import { existsSync, realpathSync } from "node:fs";
+import { join, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { readConfig, writeConfig, configPath, projectConfigPath, writeProjectConfig, maskToken, type Bot } from "./config.ts";
 import { addBotInteractive, installConfig } from "./setup.ts";
 import { agents, snippet, type Entry } from "./agents.ts";
@@ -14,6 +18,7 @@ const USAGE = `telex — send messages from local AI agents to Telegram
   telex remove <name>                 delete a bot
   telex config [name]                 install the MCP registration into this project
   telex project <name>                pin this repository to a configured bot
+  telex install [codex|claude]        install the bundled plugin for every project
 
 Options for config:
   --agent <id>          skip the prompts: claude, codex, cursor, vscode, zed, ...
@@ -31,6 +36,7 @@ Config lives at ${configPath()} (override with TELEX_CONFIG).`;
 
 // Resolves to src/index.ts in a checkout and dist/index.js once built.
 const serverEntry = fileURLToPath(new URL(import.meta.url.endsWith(".ts") ? "index.ts" : "index.js", import.meta.url));
+const marketplaceRoot = fileURLToPath(new URL("../plugins/", import.meta.url));
 
 /** Group chat ids are negative, and parseArgs reads a leading dash as another flag. */
 const { values: flags, positionals } = parseArgsFriendly({
@@ -145,9 +151,64 @@ async function run(command: string, name?: string) {
       return;
     }
 
+    case "install": {
+      if (positionals.length > 2) throw new Error("usage: telex install [codex|claude]");
+      await installPlugin(name);
+      return;
+    }
+
     default:
       throw new Error(`unknown command "${command}"\n\n${USAGE}`);
   }
+}
+
+async function installPlugin(value?: string) {
+  let provider = value?.toLowerCase();
+  if (!provider) {
+    if (!process.stdin.isTTY) throw new Error("choose a host: telex install codex or telex install claude");
+    const prompt = createInterface({ input: process.stdin, output: process.stdout });
+    try {
+      provider = (await prompt.question("Install telex for (1) Codex or (2) Claude? ")).trim().toLowerCase();
+    } finally {
+      prompt.close();
+    }
+  }
+  if (provider === "1") provider = "codex";
+  if (provider === "2") provider = "claude";
+  if (provider !== "codex" && provider !== "claude") throw new Error('choose "codex" or "claude"');
+
+  const manifest = join(marketplaceRoot, provider === "codex" ? ".agents/plugins/marketplace.json" : ".claude-plugin/marketplace.json");
+  if (!existsSync(manifest)) throw new Error(`bundled ${provider} marketplace is missing: ${manifest}`);
+  const listed = JSON.parse(host(provider, ["plugin", "marketplace", "list", "--json"]));
+  const marketplaces = provider === "codex" ? listed.marketplaces : listed;
+  const existing = marketplaces.find((entry: any) => entry.name === "telex");
+  if (existing) {
+    const source = provider === "codex" ? existing.marketplaceSource?.source ?? existing.root : existing.path;
+    if (!source || canonical(source) !== canonical(marketplaceRoot)) {
+      throw new Error(`a telex marketplace already points elsewhere (${source ?? "unknown path"}); remove it with ${provider} plugin marketplace remove telex before retrying`);
+    }
+  }
+  if (!existing || provider === "claude") {
+    host(provider, ["plugin", "marketplace", "add", marketplaceRoot, ...(provider === "claude" ? ["--scope", "user"] : [])]);
+  }
+  host(provider, provider === "codex"
+    ? ["plugin", "add", "telex@telex"]
+    : ["plugin", "install", "telex@telex", "--scope", "user"]);
+  console.log(`✓ Installed telex for ${provider}. Start a new ${provider === "codex" ? "Codex" : "Claude"} session${provider === "claude" ? " (or run /reload-plugins)" : ""} to load it.`);
+}
+
+function host(command: string, args: string[]) {
+  try {
+    return execFileSync(command, args, { encoding: "utf8" }).trim();
+  } catch (err) {
+    const failure = err as Error & { code?: string; stderr?: string | Buffer };
+    if (failure.code === "ENOENT") throw new Error(`${command} is not on PATH`);
+    throw new Error(`${command} ${args.join(" ")} failed: ${String(failure.stderr ?? failure.message).trim()}`);
+  }
+}
+
+function canonical(path: string) {
+  try { return realpathSync(path); } catch { return resolve(path); }
 }
 
 /** What --print shows: every supported agent, its installer command or its config file. */

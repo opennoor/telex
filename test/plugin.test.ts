@@ -5,6 +5,19 @@ import test from "node:test";
 
 const root = join(process.cwd(), "plugins/telex");
 
+test("both host marketplaces install the bundled telex plugin", () => {
+  const marketplaceRoot = join(process.cwd(), "plugins");
+  for (const file of [".agents/plugins/marketplace.json", ".claude-plugin/marketplace.json"]) {
+    const marketplace = JSON.parse(readFileSync(join(marketplaceRoot, file), "utf8"));
+    assert.equal(marketplace.name, "telex");
+    assert.deepEqual(marketplace.plugins.map((plugin: { name: string }) => plugin.name), ["telex"]);
+    const source = marketplace.plugins[0].source;
+    const relative = typeof source === "string" ? source : source.path;
+    assert.equal(relative, "./telex");
+    assert.ok(existsSync(join(marketplaceRoot, relative, ".mcp.json")));
+  }
+});
+
 test("host plugins register one MCP server and one explicit hook file", () => {
   const mcp = JSON.parse(readFileSync(join(root, ".mcp.json"), "utf8"));
   assert.deepEqual(Object.keys(mcp.mcpServers), ["telex"]);
