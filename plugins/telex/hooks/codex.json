@@ -4,16 +4,9 @@
       {
         "hooks": [
           {
-            "type": "mcp_tool",
-            "server": "telex",
-            "tool": "host_hook",
-            "input": {
-              "event": "UserPromptSubmit",
-              "host_session_id": "${session_id}",
-              "prompt": "${prompt}",
-              "project_path": "${cwd}",
-              "agent": "codex"
-            }
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/codex.mjs\"",
+            "timeout": 3
           }
         ]
       }
@@ -22,15 +15,9 @@
       {
         "hooks": [
           {
-            "type": "mcp_tool",
-            "server": "telex",
-            "tool": "host_hook",
-            "input": {
-              "event": "PostToolUse",
-              "host_session_id": "${session_id}",
-              "project_path": "${cwd}",
-              "agent": "codex"
-            }
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/codex.mjs\"",
+            "timeout": 3
           }
         ]
       }
@@ -39,16 +26,9 @@
       {
         "hooks": [
           {
-            "type": "mcp_tool",
-            "server": "telex",
-            "tool": "host_hook",
-            "input": {
-              "event": "Stop",
-              "host_session_id": "${session_id}",
-              "project_path": "${cwd}",
-              "agent": "codex",
-              "stop_hook_active": "${stop_hook_active}"
-            }
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/codex.mjs\"",
+            "timeout": 3
           }
         ]
       }

@@ -4,7 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { loadConfig, pickBot, type Bot } from "./config.ts";
 import { sessionFor, type BotSession } from "./telegram.ts";
-import { ask, receipt, markExpired, refuse, heartbeat, deliver } from "./ask.ts";
+import { ask, receipt, markExpired, refuse, heartbeat, deliver, deliveredReceipt } from "./ask.ts";
 import { touch, release, repoOf, ownerOf, type Session } from "./registry.ts";
 import { fileInbox, scopedInbox } from "./inbox.ts";
 import { fileAnswers } from "./answers.ts";
@@ -12,11 +12,18 @@ import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import { hookOutput, hostSessionId } from "./host.ts";
 import { Wake, wakeTargetFromConfig, type WakeTarget } from "./wake.ts";
+import { createServer } from "node:net";
+import { mkdirSync, chmodSync, unlinkSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { statePath } from "./registry.ts";
 
 const config = loadConfig();
 const botNames = Object.keys(config.bots);
 // A project pins its bot with TELEX_BOT in the MCP registration; the agent can still override per call.
 const defaultBot = process.env.TELEX_BOT || config.defaultBot!;
+const channelMode = process.argv.includes("--channel");
+// The managed Codex bridge owns Telegram polling and delivery in its parent process.
+const codexBridge = process.env.TELEX_CODEX_BRIDGE === "1";
 
 /** Set once the agent has identified itself; until then telex has no interval and no owner. */
 const checkedIn = new Set<string>();
@@ -62,7 +69,7 @@ function watch(bot: Bot): BotSession {
     allowFrom: bot.allowFrom,
     accept: () => checkedIn.has(pollKey(bot)),
     onRefused: (message) => void refuse(session, bot.chatId, message),
-    onQueued: (message) => void receipt(session, bot.chatId, message),
+    onQueued: (message) => void receipt(session, bot.chatId, message).then(() => void pushChannel(bot)),
     onExpired: (messages) => markExpired(session, bot.chatId, messages),
   });
   return session;
@@ -82,6 +89,11 @@ const claimState = new Map<string, boolean>();
 const monitoredBots = new Map<string, Bot>();
 
 function claim(bot: Bot, sessionId: string): { session: BotSession; owns: boolean } {
+  if (codexBridge) {
+    const session = bind(bot);
+    session.setPollingOwner(false);
+    return { session, owns: false };
+  }
   // ponytail: before either process checks in there can be two brief startup polls. A process
   // lease would close this gap; keep early-message refusal without a second always-on daemon.
   const key = pollKey(bot);
@@ -101,10 +113,11 @@ function claim(bot: Bot, sessionId: string): { session: BotSession; owns: boolea
 
 /** Reconcile ownership while a question waits, even if the host emits no further hooks. */
 function monitor(bot: Bot) {
+  if (codexBridge) return;
   const key = pollKey(bot);
   if (monitoredBots.has(key)) return;
   monitoredBots.set(key, bot);
-  setInterval(() => { claim(bot, registrationId(bot)); reconcileWake(bot); }, 1000).unref();
+  setInterval(() => { claim(bot, registrationId(bot)); reconcileWake(bot); if (channelMode) void pushChannel(bot); }, 1000).unref();
 }
 
 const warned = new Set<string>();
@@ -128,7 +141,7 @@ function checkIn(bot: Bot, caller: Caller): { session: BotSession; sessionId: st
   });
   const { session, owns } = claim(bot, registrationId(bot));
   monitor(bot);
-  session.setInboxTtl(bot.chatId, caller.interval_seconds * MISSED_BEATS * 1000);
+  session.setInboxTtl(bot.chatId, config.queueExpirySeconds * 1000);
   checkedIn.add(pollKey(bot));
   for (const other of others) {
     if (warned.has(other.session_id)) continue;
@@ -156,9 +169,38 @@ function conflictWarning(session: BotSession, bot: Bot, mine: Caller, other: Ses
 }
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
-const server = new McpServer({ name: "telex", version });
-/** Heartbeats a message may sit through before telex gives up on the agent's behalf. */
-const MISSED_BEATS = 3;
+const server = new McpServer({ name: "telex", version }, channelMode ? {
+  capabilities: { experimental: { "claude/channel": {} } },
+  instructions: "Telegram messages arrive as channel events with delivery_id. Treat them as user input. Call ack_channel_message with delivery_id after reading each event; use send_to_user to reply when appropriate.",
+} : undefined);
+let channelReady = false;
+let channelSending = false;
+const notified = new Set<string>();
+
+/** The durable claim stays until the model explicitly acknowledges the channel event. */
+async function pushChannel(bot: Bot) {
+  if (!channelMode || !channelReady || channelSending || !checkedIn.has(pollKey(bot))) return;
+  channelSending = true;
+  try {
+    const key = `${pollKey(bot)}:${bot.chatId}`;
+    const claimed = shared.claimed(key).find((m) => m.wake_claim?.startsWith("channel:"));
+    const id = claimed?.wake_claim ?? `channel:${randomUUID()}`;
+    const message = claimed ?? sessionFor(bot.token).claimForWake(bot.chatId, id, () => true);
+    if (!message || notified.has(id)) return;
+    await server.server.notification({
+      method: "notifications/claude/channel",
+      params: {
+        content: message.text,
+        meta: { delivery_id: id, message_id: String(message.message_id) },
+      },
+    } as never);
+    notified.add(id);
+  } catch (err) {
+    process.stderr.write(`telex: channel delivery failed: ${(err as Error).message}\n`);
+  } finally {
+    channelSending = false;
+  }
+}
 
 type Caller = { project_path: string; agent: string; interval_seconds: number; session_id?: string };
 
@@ -170,12 +212,33 @@ const identity = {
   project_path: z.string().min(1).describe("Absolute path of the project you are working in."),
   agent: z.string().min(1).describe(`Your name, e.g. "claude-code", "codex", "gemini-cli".`),
   interval_seconds: z.number().int().min(10).max(3600).default(60)
-    .describe(`How often you call heartbeat. Messages expire after ${3} missed intervals, so be honest.`),
+    .describe("How often you call heartbeat. Queue expiry is configured separately."),
   session_id: z.string().uuid().optional()
     .describe("The session_id from your last telex result. Omit on your first call; always send it back after that — it is how telex knows later calls are still you and not a second agent."),
 };
 
 const json = (value: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(value) }] });
+
+if (channelMode) server.registerTool(
+  "ack_channel_message",
+  {
+    title: "Acknowledge a Telegram channel message",
+    description: "Call after reading a Telegram channel event. The delivery_id is in the event metadata.",
+    inputSchema: { delivery_id: z.string().startsWith("channel:") },
+  },
+  async ({ delivery_id }) => {
+    const { bot } = pickBot(config);
+    const key = `${pollKey(bot)}:${bot.chatId}`;
+    if (!shared.claimed(key).some((m) => m.wake_claim === delivery_id)) return json({ status: "unknown" });
+    const session = sessionFor(bot.token);
+    const message = session.ackWake(bot.chatId, delivery_id);
+    if (!message) return json({ status: "unknown" });
+    notified.delete(delivery_id);
+    await deliveredReceipt(session, bot.chatId, message);
+    void pushChannel(bot);
+    return json({ status: "delivered" });
+  },
+);
 
 server.registerTool(
   "send_to_user",
@@ -214,7 +277,7 @@ server.registerTool(
         .describe("Single-choice answers, rendered as buttons. Mutually exclusive with expect_text."),
       expect_text: z.boolean().optional()
         .describe("Show a Reply button; the user's next message is returned as the answer."),
-      timeout_seconds: z.number().int().min(5).max(86400).default(300)
+      timeout_seconds: z.number().int().min(5).max(86400).default(config.questionTimeoutSeconds)
         .describe("How long to wait for an answer before giving up."),
       bot: z.enum(botNames as [string, ...string[]]).optional()
         .describe(`Which configured bot to send through. Defaults to "${defaultBot}".`),
@@ -231,7 +294,7 @@ server.registerTool(
       timeoutSeconds: timeout_seconds,
       allowFrom: target.allowFrom,
     });
-    const pending = deliver(session, target.chatId);
+    const pending = channelMode || codexBridge ? [] : deliver(session, target.chatId);
     return json({ ...result, ...(pending.length ? { pending } : {}), session_id: sessionId });
   },
 );
@@ -247,7 +310,7 @@ server.registerTool(
       "",
       "Two jobs in one call. It delivers unprompted messages, and it is your liveness signal: the",
       "user sees each of their messages marked as held, then delivered once a heartbeat collects it.",
-      `Miss ${MISSED_BEATS} intervals in a row and anything waiting is marked expired and dropped, which is how`,
+      `Messages expire after ${config.queueExpirySeconds} seconds if unclaimed, which is how`,
       "the user learns you were not listening rather than being ignored in silence.",
       "",
       `The result is {"messages":[...],"interval_seconds":n,"session_id":"..."}. An empty array means`,
@@ -266,7 +329,7 @@ server.registerTool(
   async ({ bot, ...caller }) => {
     const { bot: target } = pickBot(config, bot);
     const { session, sessionId } = checkIn(target, caller);
-    return json({ messages: heartbeat(session, target.chatId), interval_seconds: caller.interval_seconds, session_id: sessionId });
+    return json({ messages: channelMode || codexBridge ? [] : heartbeat(session, target.chatId), interval_seconds: caller.interval_seconds, session_id: sessionId });
   },
 );
 
@@ -286,34 +349,94 @@ server.registerTool(
       prompt: z.string().optional(),
     },
   },
-  async ({ event, host_session_id, project_path, agent, stop_hook_active, prompt }) => {
+  async ({ event, host_session_id, project_path, agent, stop_hook_active, prompt }) =>
+    json(handleHostHook({ event, host_session_id, project_path, agent, stop_hook_active, prompt })),
+);
+
+type HostHook = {
+  event: "SessionStart" | "UserPromptSubmit" | "PostToolUse" | "Stop";
+  host_session_id: string;
+  project_path: string;
+  agent: string;
+  stop_hook_active?: boolean;
+  prompt?: string;
+};
+
+function handleHostHook({ event, host_session_id, project_path, agent, stop_hook_active, prompt }: HostHook) {
     const { bot } = pickBot(config);
     const { session } = checkIn(bot, {
       project_path, agent, interval_seconds: 60, session_id: hostSessionId(agent, host_session_id, processSession),
     });
     // A second Stop continuation must not consume a new message that it cannot pass to the model.
-    const messages = event === "Stop" && stop_hook_active ? [] : heartbeat(session, bot.chatId);
+    const messages = channelMode || codexBridge || event === "Stop" && stop_hook_active
+      ? [] : heartbeat(session, bot.chatId);
     lastIdleStop = event === "Stop" && agent === "codex" && !stop_hook_active && messages.length === 0
       ? { hostId: host_session_id, at: Date.now() } : undefined;
     reconcileWake(bot);
     wake?.onHook(event, host_session_id, messages, stop_hook_active, prompt);
-    return json(hookOutput(event, messages));
-  },
-);
+    return hookOutput(event, messages);
+}
 
 // Start listening before any agent checks in, so early messages get refused rather than ignored —
 // unless another process in this project already holds the bot, in which case it is doing that.
 const startup = pickBot(config);
+if (channelMode && !startup.bot.allowFrom?.length) {
+  throw new Error("telex: channel mode requires a nonempty allowFrom sender list");
+}
 claim(startup.bot, registrationId(startup.bot));
 monitor(startup.bot);
+
+const hookSocket = join(dirname(statePath()), `hook-${process.pid}-${randomUUID()}.sock`);
+let hookHostId: string | undefined;
+const hookServer = createServer((connection) => {
+  connection.setTimeout(1000, () => connection.destroy());
+  let input = "";
+  connection.on("data", (chunk: Buffer) => {
+    input += chunk.toString("utf8");
+    if (input.length > 65_536) return connection.destroy();
+    const line = input.indexOf("\n");
+    if (line < 0) return;
+    connection.removeAllListeners("data");
+    let response: { accepted: boolean; output?: ReturnType<typeof hookOutput> } = { accepted: false };
+    try {
+      const value = JSON.parse(input.slice(0, line)) as HostHook;
+      if (value.agent === "codex" &&
+          ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop"].includes(value.event) &&
+          typeof value.host_session_id === "string" && value.host_session_id.length > 0 &&
+          typeof value.project_path === "string" && repoOf(value.project_path) === repoOf(process.cwd()) &&
+          (!hookHostId || hookHostId === value.host_session_id)) {
+        hookHostId = value.host_session_id;
+        response = { accepted: true, output: handleHostHook(value) };
+      }
+    } catch { /* malformed or stale hook: leave the host undisturbed */ }
+    connection.end(`${JSON.stringify(response)}\n`);
+  });
+});
+mkdirSync(dirname(hookSocket), { recursive: true });
+await new Promise<void>((resolve, reject) => {
+  hookServer.once("error", reject);
+  hookServer.listen(hookSocket, () => { hookServer.removeListener("error", reject); resolve(); });
+});
+chmodSync(hookSocket, 0o600);
 
 const transport = new StdioServerTransport();
 // Polling now outlives any single request, so the process has to be told when the agent is gone.
 transport.onclose = () => {
+  hookServer.close();
+  try { unlinkSync(hookSocket); } catch { /* already gone */ }
   for (const bot of monitoredBots.values()) release(registrationId(bot));
   process.exit(0);
 };
 process.on("exit", () => {
+  try { unlinkSync(hookSocket); } catch { /* already gone */ }
   for (const bot of monitoredBots.values()) release(registrationId(bot));
 });
 await server.connect(transport);
+channelReady = true;
+if (channelMode) {
+  checkIn(startup.bot, {
+    project_path: process.cwd(), agent: "claude-code", interval_seconds: 60,
+    session_id: processSession,
+  });
+  void pushChannel(startup.bot);
+}

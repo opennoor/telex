@@ -16,14 +16,32 @@ test("CLI adds, modifies, routes, and removes a bot", () => {
 
   run("add", "main", "--token", "123:abc", "--chat-id", "7", "--allow", "42");
   run("set", "main", "--chat-id=-1007", "--allow", "42,43");
+  run("set-timeouts", "--queue-expiry", "7200", "--question-timeout", "900");
   run("project", "main");
   const listed = JSON.parse(run("list", "--json"));
   assert.equal(listed.bots.main.chatId, -1007);
   assert.deepEqual(listed.bots.main.allowFrom, [42, 43]);
   assert.notEqual(listed.bots.main.token, "123:abc");
+  assert.equal(listed.queueExpirySeconds, 7200);
+  assert.equal(listed.questionTimeoutSeconds, 900);
   assert.deepEqual(JSON.parse(readFileSync(join(dir, ".telex.json"), "utf8")), { bot: "main" });
   run("remove", "main");
   assert.deepEqual(JSON.parse(readFileSync(config, "utf8")).bots, {});
+});
+
+test("CLI rejects invalid timeout settings without changing config", () => {
+  const dir = mkdtempSync(join(tmpdir(), "telex-timeouts-"));
+  const config = join(dir, "config.json");
+  const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+  const env = { ...process.env, TELEX_CONFIG: config };
+  const run = (...args: string[]) => spawnSync(process.execPath, [cli, ...args], { cwd: dir, encoding: "utf8", env });
+
+  assert.equal(run("add", "main", "--token", "123:abc", "--chat-id", "7").status, 0);
+  const before = readFileSync(config, "utf8");
+  const invalid = run("set-timeouts", "--queue-expiry", "0", "--question-timeout", "900");
+  assert.equal(invalid.status, 1);
+  assert.match(invalid.stderr, /--queue-expiry must be an integer/);
+  assert.equal(readFileSync(config, "utf8"), before);
 });
 
 test("config offers only plugin hosts and rejects removed shortcuts without writing files", () => {
@@ -50,6 +68,9 @@ test("config offers only plugin hosts and rejects removed shortcuts without writ
   assert.deepEqual(readdirSync(dir), []);
   assert.equal(existsSync(config), false);
   assert.deepEqual(JSON.parse(run("config", "--json").stdout).mcpServers.telex, { command: "telex", args: ["serve"] });
+  assert.deepEqual(JSON.parse(run("config", "--agent", "claude", "--channel", "--json").stdout).mcpServers.telex,
+    { command: "telex", args: ["serve", "--channel"] });
+  assert.equal(run("config", "--agent", "codex", "--channel", "--json").status, 1);
 });
 
 test("CLI installs the bundled plugin through each host and reuses its marketplace", () => {

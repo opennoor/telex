@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { BotSession, TelegramError, toTelegramHtml, fromMarkdown, type Update } from "../src/telegram.ts";
 import { ask, chunk, compose, receipt, refuse, heartbeat, markExpired } from "../src/ask.ts";
+import { memoryInbox } from "../src/inbox.ts";
 
 /** Fake Bot API: records calls, answers getUpdates with nothing so we can inject updates by hand. */
 function fakeSession() {
@@ -256,28 +257,40 @@ test("a heartbeat delivers what was said and edits the receipt to say so", async
   assert.equal(calls.filter((c) => c.method === "editMessageText").length, 1);
 });
 
-test("a message nobody collects within three beats is expired and dropped", async (t) => {
+test("a different process expires a queued message before collecting it", async () => {
+  const { session, last } = fakeSession();
+  const store = memoryInbox();
+  const now = Date.now();
+  store.push("7", { message_id: 9, text: "old", received_at: now, receipt_id: 101 }, now + 1000);
+  session.setInboxStore(store); // no watch: this session did not poll the message
+
+  assert.deepEqual(heartbeat(session, 7, now + 1001), []);
+  await tick();
+  assert.match(last("editMessageText")!.params.text, /Expired/);
+});
+
+test("a message nobody collects before queue expiry is dropped", async (t) => {
   const { session, last } = fakeSession();
   t.after(() => session.stop());
   watched(session);
 
   const t0 = Date.now();
-  session.setInboxTtl(7, 30_000); // a 10s interval, three beats
+  session.setInboxTtl(7, 30_000);
   session.dispatch(userSaid("still there?"));
   await tick();
 
-  // Two beats late is still within reach...
+  // A message inside the deadline is still within reach.
   assert.deepEqual(heartbeat(session, 7, t0 + 20_000).map((m) => m.text), ["still there?"]);
 
   session.dispatch({ ...userSaid("hello?"), update_id: 2 });
   await tick();
-  // ...but past three, the user is told rather than left wondering.
+  // After the deadline, the user is told rather than left wondering.
   assert.deepEqual(heartbeat(session, 7, t0 + 31_000), []);
   await tick();
   assert.match(last("editMessageText")!.params.text, /Expired/);
 });
 
-test("nothing expires until an agent has declared its interval", async (t) => {
+test("nothing expires until a queue duration has been configured", async (t) => {
   const { session, calls } = fakeSession();
   t.after(() => session.stop());
   watched(session);

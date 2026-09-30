@@ -6,20 +6,22 @@ import { existsSync, realpathSync, mkdirSync, writeFileSync, unlinkSync } from "
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
-import { readConfig, writeConfig, loadConfig, configPath, projectConfigPath, writeProjectConfig, maskToken, pickBot, type Bot } from "./config.ts";
+import { readConfig, writeConfig, loadConfig, configPath, projectConfigPath, writeProjectConfig, maskToken, pickBot, DEFAULT_QUEUE_EXPIRY_SECONDS, DEFAULT_QUESTION_TIMEOUT_SECONDS, type Bot } from "./config.ts";
 import { addBotInteractive, installConfig } from "./setup.ts";
 import { agents, snippet, type Entry } from "./agents.ts";
 import { wakeConfigPath, processStart, processCommand, processDescendsFrom, withWakeInputLock } from "./wake.ts";
 import { fileInbox, scopedInbox } from "./inbox.ts";
 import { apiFor, TelegramError } from "./telegram.ts";
 import { isLive, registeredSessions } from "./registry.ts";
+import { codexStatus, disableCodex, pendingCodex, recoverCodex, runCodex } from "./codex.ts";
 
 const USAGE = `telex — send messages from local AI agents to Telegram
 
-  telex serve                         run the MCP server (stdio); what agents launch
+  telex serve [--channel]             run the MCP server (stdio); --channel enables Claude push
   telex add [name]                    add a bot, guided; or pass --token/--chat-id
   telex list                          show configured bots
   telex set <name> [options]          change a bot
+  telex set-timeouts [options]        set queue expiry and question timeout
   telex remove <name>                 delete a bot
   telex config [name]                 install the MCP registration into this project
   telex project <name>                pin this repository to a configured bot
@@ -28,9 +30,14 @@ const USAGE = `telex — send messages from local AI agents to Telegram
   telex wake disable                 stop automatic terminal input
   telex wake pending                 list unconfirmed terminal submissions
   telex wake recover <id> --retry|--delivered  resolve one after checking the pane
+  telex codex run [bot]               run a Telex-owned Codex thread in the foreground
+  telex codex status|disable [bot]    inspect or stop the bridge
+  telex codex pending [bot]           list uncertain Codex deliveries
+  telex codex recover <id> --retry|--delivered [bot]  resolve after inspecting the thread
 
 Options for config:
   --agent <id>          skip the prompts: claude, codex
+  --channel             opt into Claude Code channel push mode (requires host channel flag)
   --scope <local|project>  for agents with both: gitignored file or committed file
   --print               only show the commands and file syntax; write nothing
   -y, --yes             don't ask about the current directory
@@ -40,6 +47,10 @@ Options for add/set:
   --chat-id <id>        chat the bot writes to (negative ids: --chat-id=-1001234567890)
   --allow <id,id>       Telegram user ids allowed to answer ("any" to clear)
   --default             make this the default bot
+
+Options for set-timeouts (seconds, 5 to 86400):
+  --queue-expiry <n>    how long an uncollected message stays queued (default 3600)
+  --question-timeout <n>  how long to wait for an answer (default 600)
 
 Config lives at ${configPath()} (override with TELEX_CONFIG).`;
 
@@ -64,6 +75,9 @@ const { values: flags, positionals } = parseArgsFriendly({
     socket: { type: "string" },
     retry: { type: "boolean" },
     delivered: { type: "boolean" },
+    "queue-expiry": { type: "string" },
+    "question-timeout": { type: "string" },
+    channel: { type: "boolean" },
   },
 });
 
@@ -87,6 +101,7 @@ function parseArgsFriendly<T extends ParseArgsConfig>(options: T): ReturnType<ty
 async function run(command: string, name?: string) {
   switch (command) {
     case "serve":
+      if (name) throw new Error("usage: telex serve [--channel]");
       await import("./index.ts");
       return;
 
@@ -120,6 +135,18 @@ async function run(command: string, name?: string) {
       return;
     }
 
+    case "set-timeouts": {
+      if (name || (flags["queue-expiry"] === undefined && flags["question-timeout"] === undefined)) {
+        throw new Error("usage: telex set-timeouts --queue-expiry <seconds> and/or --question-timeout <seconds>");
+      }
+      const config = readConfig();
+      if (flags["queue-expiry"] !== undefined) config.queueExpirySeconds = duration(flags["queue-expiry"], "--queue-expiry");
+      if (flags["question-timeout"] !== undefined) config.questionTimeoutSeconds = duration(flags["question-timeout"], "--question-timeout");
+      writeConfig(config);
+      console.log(`✓ Timeouts: queue expiry ${config.queueExpirySeconds ?? DEFAULT_QUEUE_EXPIRY_SECONDS}s; question ${config.questionTimeoutSeconds ?? DEFAULT_QUESTION_TIMEOUT_SECONDS}s`);
+      return;
+    }
+
     case "remove": {
       const config = readConfig();
       required(config.bots, name);
@@ -142,16 +169,18 @@ async function run(command: string, name?: string) {
         console.log(`${n === config.defaultBot ? "*" : " "} ${n.padEnd(16)} chat ${String(bot.chatId).padEnd(16)} ${maskToken(bot.token)}  allow: ${allow}`);
       }
       console.log(`\n* = default. Config: ${configPath()}`);
+      console.log(`Queue expiry: ${config.queueExpirySeconds ?? DEFAULT_QUEUE_EXPIRY_SECONDS}s; question timeout: ${config.questionTimeoutSeconds ?? DEFAULT_QUESTION_TIMEOUT_SECONDS}s`);
       return;
     }
 
     case "config": {
       const config = readConfig();
       if (name) required(config.bots, name);
-      const entry = { command: "telex", args: ["serve"], ...(name ? { env: { TELEX_BOT: name } } : {}) };
+      if (flags.channel && flags.agent !== "claude") throw new Error("--channel requires --agent claude");
+      const entry = { command: "telex", args: ["serve", ...(flags.channel ? ["--channel"] : [])], ...(name ? { env: { TELEX_BOT: name } } : {}) };
       if (flags.json) return console.log(JSON.stringify({ mcpServers: { telex: entry } }, null, 2));
       if (flags.print) return printConfigs(entry, name);
-      await installConfig(name, { agent: flags.agent, scope: flags.scope, yes: flags.yes });
+      await installConfig(name, { agent: flags.agent, scope: flags.scope, yes: flags.yes, channel: flags.channel });
       return;
     }
 
@@ -173,9 +202,42 @@ async function run(command: string, name?: string) {
       await wakeCommand(name);
       return;
 
+    case "codex":
+      await codexCommand(name);
+      return;
+
     default:
       throw new Error(`unknown command "${command}"\n\n${USAGE}`);
   }
+}
+
+async function codexCommand(action?: string) {
+  if (action === "run") return runCodex(positionals[2]);
+  if (action === "status") {
+    const { state, running, path } = codexStatus(positionals[2]);
+    console.log(state ? `${running ? "running" : "stopped"}\t${state.threadId}\t${path}` : `not configured\t${path}`);
+    return;
+  }
+  if (action === "disable") {
+    console.log(disableCodex(positionals[2]) ? "✓ Codex bridge disabled." : "Codex bridge is not configured.");
+    return;
+  }
+  if (action === "pending") {
+    const { claims, replies } = pendingCodex(positionals[2]);
+    for (const message of claims) console.log(`input\t${message.message_id}\t${message.text}`);
+    for (const reply of replies) console.log(`reply\t${reply.messages.map((m) => m.message_id).join(",")}\t${reply.text ? "ready" : "awaiting Codex"}`);
+    return;
+  }
+  if (action === "recover") {
+    const id = Number(positionals[2]);
+    if (!Number.isSafeInteger(id) || id <= 0 || Boolean(flags.retry) === Boolean(flags.delivered)) {
+      throw new Error("usage: telex codex recover <message-id> --retry|--delivered");
+    }
+    await recoverCodex(id, Boolean(flags.retry), positionals[3]);
+    console.log(`✓ Message ${id} ${flags.retry ? "released for retry" : "marked delivered"}.`);
+    return;
+  }
+  throw new Error("usage: telex codex run|status|disable|pending|recover");
 }
 
 async function wakeCommand(action?: string) {
@@ -338,6 +400,14 @@ function setDefault(name: string) {
 
 const numeric = (v: string) => (/^-?\d+$/.test(v.trim()) ? Number(v.trim()) : v.trim());
 
+function duration(value: string, flag: string): number {
+  const seconds = Number(value);
+  if (!/^\d+$/.test(value) || !Number.isSafeInteger(seconds) || seconds < 5 || seconds > 86400) {
+    throw new Error(`${flag} must be an integer from 5 to 86400 seconds`);
+  }
+  return seconds;
+}
+
 function parseAllow(value?: string): number[] | undefined {
   if (!value || value === "any") return undefined;
   return value.split(",").map((v) => {
@@ -349,6 +419,8 @@ function parseAllow(value?: string): number[] | undefined {
 
 const redact = (config: ReturnType<typeof readConfig>) => ({
   ...config,
+  queueExpirySeconds: config.queueExpirySeconds ?? DEFAULT_QUEUE_EXPIRY_SECONDS,
+  questionTimeoutSeconds: config.questionTimeoutSeconds ?? DEFAULT_QUESTION_TIMEOUT_SECONDS,
   bots: Object.fromEntries(Object.entries(config.bots).map(([n, b]) => [n, { ...b, token: maskToken(b.token) }])),
 });
 

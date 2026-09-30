@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.7.2        # pin an exact published version
+npm i -g @sojaner/telex@0.8.0        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -61,10 +61,13 @@ contains no bot tokens and keeps its MCP registration in `plugins/telex/.mcp.jso
 
 The plugin adds host hooks that check for Telegram messages at `UserPromptSubmit`, after tool calls,
 and before the host stops. They identify the session using the host session id and project path.
-Codex requires review and trust for bundled hooks before running them. Claude Code may run
+Codex uses a local command hook: when its Telex MCP process is disconnected, the hook exits silently;
+when it reconnects, the hook resumes delivery. Codex requires review and trust for bundled hooks
+before running them. Claude Code may run
 `SessionStart` before MCP is ready, so telex hooks use `UserPromptSubmit`, `PostToolUse`, and `Stop`
-instead. Hooks cannot wake an idle or terminated host; use the host's resume or automation feature
-for that. Keep manual `heartbeat` calls as a fallback for unsupported hosts and long reasoning
+instead. Hooks cannot wake an idle or terminated host. Claude Code's opt-in channel mode below can
+push into an open idle session; Codex can use the managed bridge or explicit tmux wake mode below. Keep manual
+`heartbeat` calls as a fallback for unsupported hosts and long reasoning
 stretches between tool calls. Telegram text is external user content: treat it as untrusted input,
 not as instructions from the host. See [plugin setup and behavior](plugins/telex/README.md).
 
@@ -128,6 +131,7 @@ like another flag.
 telex add [name]              add a bot, guided; or --token … --chat-id …
 telex list                    configured bots, tokens masked
 telex set <name> [options]    change token / chat / allowlist / default
+telex set-timeouts [options]  set queue expiry and question timeout
 telex remove <name>           delete a bot
 telex config [name]           install the MCP registration into this project
 telex project <name>          pin this repository to a configured bot
@@ -143,12 +147,25 @@ Options for `add` and `set`:
 | `--allow <id,id>` | Telegram user ids allowed to answer; `any` clears the list |
 | `--default` | Make this the global default bot |
 
+Set the two deadlines independently (seconds, 5 to 86400):
+
+```sh
+telex set-timeouts --queue-expiry 7200 --question-timeout 900
+```
+
+`--queue-expiry` controls how long an uncollected user message stays queued; it defaults to
+3600 seconds. `--question-timeout` sets the default wait for an answer to a question; it defaults
+to 600 seconds. A `send_to_user` call can still pass `timeout_seconds` to override that question.
+The deadline is saved with each queued message, so restarting or switching the polling process
+does not reset it. `telex list` shows both current values.
+
 ```sh
 $ telex list
 * work             chat 987654321        8123456789:******bAcD  allow: 987654321
   team             chat -1001234567890   8234567890:******xYzW  allow: 987654321, 123456789
 
 * = default. Config: /home/you/.config/telex/config.json
+Queue expiry: 3600s; question timeout: 600s
 ```
 
 `telex list --json` prints the same thing as JSON, tokens still masked.
@@ -162,6 +179,8 @@ $ telex list
 ```json
 {
   "defaultBot": "work",
+  "queueExpirySeconds": 3600,
+  "questionTimeoutSeconds": 600,
   "bots": {
     "work": {
       "token": "8123456789:AAH…",
@@ -198,11 +217,13 @@ telex config
 
 asks whether this directory is the project you mean, then which agent to install for, and does
 the install: it runs that agent's own CLI when it has one, and writes the config file itself when
-it does not. The server command is always `telex serve`.
+it does not. The server command is `telex serve` (or `telex serve --channel` for Claude Code's
+opt-in channel mode).
 
 | Flag | Meaning |
 |---|---|
 | `--agent <id>` | skip the prompts: `claude`, `codex` |
+| `--channel` | register the Claude Code channel mode; requires `--agent claude` |
 | `--scope local\|project` | for agents with both: the gitignored file or the committed one |
 | `--print` | only show the commands and file shapes; write nothing |
 | `-y` | don't ask about the current directory |
@@ -305,11 +326,11 @@ deliberately (`bot: "oncall"` for something urgent, say).
 | `message` | string, required | The copy to show you, in Telegram HTML. |
 | `options` | string[], optional | Up to 10 single-choice answers, rendered as buttons. |
 | `expect_text` | boolean, optional | Show one *Reply* button; your next message becomes the answer. |
-| `timeout_seconds` | number, default 300 | Deadline for the whole exchange, 5s to 24h. |
+| `timeout_seconds` | number, default 600 | Deadline for the whole exchange, 5s to 24h; configurable with `telex set-timeouts`. |
 | `bot` | string, optional | Which configured bot to use. |
 | `project_path` | string, required | Absolute path of the project the agent is working in. |
 | `agent` | string, required | The agent's own name, e.g. `claude-code`. |
-| `interval_seconds` | number, default 60 | Expected check-in interval; used to expire held messages. |
+| `interval_seconds` | number, default 60 | Expected check-in interval. |
 | `session_id` | string, optional | The `session_id` from the agent's previous telex result. |
 
 `options` and `expect_text` are mutually exclusive. With neither, the message is a one-way
@@ -353,10 +374,9 @@ too, delivered exactly as a heartbeat would:
 
 You can talk to the bot without being asked. While an agent session is open, telex long-polls
 Telegram continuously and queues inbound messages immediately; the host still decides when the
-model reads them. An MCP server cannot wake a fully terminated Codex or Claude Code process: their
-documented MCP transports (stdio, HTTP, or SSE) connect tools but do not start an agent turn. An
-idle session receives the message at its next configured hook event or heartbeat, unless the optional
-Codex tmux wake mode below is enabled. A terminated host requires its own resume or automation facility.
+model reads them. An idle Codex plugin session receives a message at its next hook or heartbeat;
+the managed bridge and optional tmux wake mode below provide active delivery. Claude Code can receive messages immediately in an
+open session through its opt-in channel mode below. Neither mode wakes a terminated host.
 Telex holds what you said until the agent checks in, and edits
 a single receipt under your message as it moves:
 
@@ -365,12 +385,63 @@ a single receipt under your message as it moves:
 | 🕦 *Held for the agent's next check-in.* | telex has your message and is holding it. |
 | ‼️ *Not accepted — no agent has checked in for this project yet.* | The server is running but no agent has identified itself. Nothing is holding your message. |
 | 📬 *Delivered to the agent.* | A host hook or heartbeat collected it; the agent has it now. |
-| 🗑️ *Expired — the agent never picked this up.* | Three intervals passed with no check-in. Dropped. |
+| 🗑️ *Expired — the agent never picked this up.* | The configured queue expiry passed without collection. Dropped. |
 | *nothing at all* | Nothing is running for that project. The message went nowhere. |
 
 Silence is the signal: telex only polls while its process is alive, so a message with no receipt
 at all means no agent is there to receive it. Held messages are capped at 50 per chat, oldest
 dropped.
+
+#### Claude Code channel mode
+
+[Claude Code Channels](https://code.claude.com/docs/en/channels-reference) can inject Telegram
+messages into an open session while it is active or idle. They are in research preview and require
+an explicit host opt-in. Configure a nonempty `allowFrom` sender list, then register the standalone
+MCP server for this project and start Claude Code with the channel enabled:
+
+```sh
+telex config --agent claude --channel
+claude --dangerously-load-development-channels server:telex
+```
+
+Use this standalone registration without the bundled Claude plugin in the same session, so its
+hook process does not collect messages before the channel receives them. The long-lived Telex MCP
+process polls Telegram once and emits a channel event when an allowed message arrives. After
+reading an event, Claude calls `ack_channel_message` with its `delivery_id`; Telex then marks the
+Telegram receipt delivered. If the process disconnects first, the same event replays on reconnect.
+If the host blocks or drops channel events, Telex cannot detect that through MCP, so the receipt
+stays held. `send_to_user` remains available for replies and questions. Organization policy may
+also need to enable channels.
+
+#### Codex managed bridge
+
+`telex codex run` starts a **new Telex-owned Codex app-server thread** for this project. It polls
+the selected bot, starts a turn when the thread is idle, steers its active turn, and forwards the
+final answer to Telegram. The bridge stays in the foreground; keep that terminal running. Set a
+nonempty sender allowlist before starting it:
+
+```sh
+telex add bridge --token <token> --chat-id <id> --allow <your-telegram-user-id>
+telex project bridge
+telex codex run
+```
+
+Use a separate bot from a concurrently running Telex MCP session. The bridge refuses to start when
+another live Telex session already owns that bot. Manage it with `telex codex status`,
+`telex codex disable`, and `telex codex pending`. A successful app-server RPC marks the Telegram
+receipt delivered. If the RPC connection fails after submission, Telex holds the claim because it
+cannot tell whether Codex accepted it. Inspect the bridge's printed thread ID, disable the bridge,
+then run `telex codex recover <message-id> --delivered` if the message appears in the thread or
+`--retry` if it did not. A failed final Telegram reply also stays in `telex codex pending`;
+after inspecting the chat, use `--delivered` if it arrived or `--retry` to send it again. Add the
+bot name after the flag when it is not the project's default. Starting the bridge again resumes
+its saved thread.
+
+This mode does not attach to an existing desktop or CLI conversation. The ordinary Codex plugin
+hooks remain the way to exchange messages with an already-open session at lifecycle events; the
+tmux mode below targets a detached CLI pane. The bridge uses the [Codex app-server protocol](https://learn.chatgpt.com/docs/app-server)
+and follows the current Codex approval policy; it declines approval requests that need a local
+user decision.
 
 #### Wake an idle Codex conversation in tmux
 
@@ -387,7 +458,7 @@ Codex plugin from another terminal, then check that `telex list` shows nonempty 
 your bot:
 
 ```sh
-npm i -g @sojaner/telex@0.7.2
+npm i -g @sojaner/telex@0.8.0
 telex install codex
 telex list
 ```
@@ -403,7 +474,7 @@ exec codex --no-daemon resume <session-id>
 server; installing the package cannot reload an already-running MCP process. `exec` makes Codex
 the pane process rather than leaving a shell underneath it. If the old pane closed on exit, create
 a new dedicated tmux pane and run the same `exec codex --no-daemon resume <session-id>` command in
-it. Finish a new turn so the v0.7.2 Telex server sees a fresh `Stop` hook, then detach. On a new
+it. Finish a new turn so the v0.8.0 Telex server sees a fresh `Stop` hook, then detach. On a new
 conversation, start it directly with
 `exec codex --no-daemon` and likewise finish a turn before binding.
 
@@ -460,17 +531,16 @@ immediately — it never blocks and never waits for you.
 {"messages": [{"text": "ship it", "received_at": "2026-09-15T18:22:04.000Z", "waited_seconds": 12}], "interval_seconds": 60}
 ```
 
-An empty `messages` array is the normal case — nothing was said, keep working. The interval does
-double duty as a liveness signal: miss three in a row and anything waiting is marked expired and
-dropped, so you learn the agent stopped listening instead of watching a message sit unanswered
-forever.
+An empty `messages` array is the normal case — nothing was said, keep working. A held message
+expires after the configured queue expiry, even if the agent stops checking in or another process
+takes over polling.
 
 ### Who is calling
 
 Every tool call carries `project_path`, `agent` and `interval_seconds`, and every result hands back
 a `session_id` for the agent to echo on its next call. That does four things:
 
-- **The expiry clock starts at the first call**, not the first heartbeat. A message you send a
+- **The queue starts at the first call**, not the first heartbeat. A message you send a
   second later already has a deadline.
 - **Messages sent before any agent has checked in are refused**, not held. The server starts with
   your agent, but until the agent actually calls a telex tool nothing owns the bot — telex says so
@@ -583,7 +653,7 @@ A notification, no answer wanted:
 | Messages stay "held" | The agent isn't calling `heartbeat`. It will still see them on its next tool call. |
 | Everything is "not accepted" | The agent hasn't called any telex tool yet, so nothing owns the bot. |
 | Warned about two agents | Two projects share one bot. `telex add <name>` and repoint one of them. |
-| Messages expire constantly | The agent's `interval_seconds` is shorter than how often it really checks in. |
+| Messages expire too soon | Increase queue expiry with `telex set-timeouts --queue-expiry <seconds>`. |
 
 Run the server by hand to see startup errors that an agent would swallow:
 

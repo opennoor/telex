@@ -27,7 +27,7 @@ export type InboxStore = {
   claim(key: string, id: string, accept: (message: Incoming) => boolean): Incoming | undefined;
   /** Remove only the message confirmed by the matching host prompt hook. */
   ack(key: string, id: string): Incoming | undefined;
-  claimed(key: string): Incoming[];
+  claimed(key: string): (Incoming & { wake_claim?: string })[];
   resolve(key: string, messageId: number, retry: boolean): Incoming | undefined;
 };
 
@@ -176,7 +176,8 @@ export function fileInbox(): InboxStore {
       });
     },
     claimed(key) {
-      return withLock(() => read().filter((m) => m.key === key && m.wake_claim).map(strip));
+      return withLock(() => read().filter((m) => m.key === key && m.wake_claim)
+        .map((m) => ({ ...strip(m), wake_claim: m.wake_claim })));
     },
     resolve(key, messageId, retry) {
       return withLock(() => {
