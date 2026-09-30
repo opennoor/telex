@@ -116,6 +116,10 @@ function updateReceipt(session: BotSession, chatId: number | string, message: In
   }).catch(() => {}); // an unchanged or deleted receipt is not worth failing a heartbeat over
 }
 
+/** Settle a queued receipt after a host confirms it accepted delivery. */
+export const deliveredReceipt = (session: BotSession, chatId: number | string, message: Incoming) =>
+  updateReceipt(session, chatId, message, RECEIPT.delivered);
+
 export const markExpired = (session: BotSession, chatId: number | string, messages: Incoming[]) => {
   for (const message of messages) void updateReceipt(session, chatId, message, RECEIPT.expired);
 };
@@ -130,19 +134,16 @@ export function refuse(session: BotSession, chatId: number | string, message: In
   }).catch(() => {});
 }
 
-/**
- * One heartbeat: drop whatever the agent left too long, then hand over the rest. Returns
- * immediately — the agent's own interval is the clock, and its silence is what expires a message.
- */
+/** One heartbeat: collect the queued messages and return immediately. */
 export function heartbeat(session: BotSession, chatId: number | string, now = Date.now()): Delivered[] {
-  session.sweepInbox(now);
   return deliver(session, chatId, now);
 }
 
 /** Hand the queue to the agent and say so in the chat. */
 export function deliver(session: BotSession, chatId: number | string, now = Date.now()): Delivered[] {
+  markExpired(session, chatId, session.sweepInbox(now, chatId));
   return session.take(chatId).map((message) => {
-    void updateReceipt(session, chatId, message, RECEIPT.delivered);
+    void deliveredReceipt(session, chatId, message);
     return {
       text: message.text,
       received_at: new Date(message.received_at).toISOString(),

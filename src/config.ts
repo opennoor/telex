@@ -4,7 +4,15 @@ import { dirname, join } from "node:path";
 
 /** allowFrom: Telegram user ids permitted to answer. Omit to trust anyone in the chat. */
 export type Bot = { token: string; chatId: number | string; allowFrom?: number[] };
-export type Config = { defaultBot?: string; bots: Record<string, Bot> };
+export type Config = {
+  defaultBot?: string;
+  bots: Record<string, Bot>;
+  queueExpirySeconds?: number;
+  questionTimeoutSeconds?: number;
+};
+
+export const DEFAULT_QUEUE_EXPIRY_SECONDS = 3600;
+export const DEFAULT_QUESTION_TIMEOUT_SECONDS = 600;
 
 export const configPath = () =>
   process.env.TELEX_CONFIG ?? join(process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config"), "telex", "config.json");
@@ -39,7 +47,12 @@ export function readConfig(): Config {
   if (!existsSync(path)) return { bots: {} };
   try {
     const raw = JSON.parse(readFileSync(path, "utf8")) as Config;
-    return { defaultBot: raw.defaultBot, bots: raw.bots ?? {} };
+    return {
+      defaultBot: raw.defaultBot,
+      bots: raw.bots ?? {},
+      queueExpirySeconds: raw.queueExpirySeconds,
+      questionTimeoutSeconds: raw.questionTimeoutSeconds,
+    };
   } catch (err) {
     throw new Error(`telex: ${path} is not valid JSON: ${(err as Error).message}`);
   }
@@ -52,7 +65,7 @@ export function writeConfig(config: Config) {
 }
 
 /** Validated config for the server, which cannot do anything useful without at least one bot. */
-export function loadConfig(): Config {
+export function loadConfig(): Config & { queueExpirySeconds: number; questionTimeoutSeconds: number } {
   const config = readConfig();
   const names = Object.keys(config.bots);
   if (names.length === 0) throw new Error(`telex: no bots configured in ${configPath()} — run "telex add"`);
@@ -62,7 +75,14 @@ export function loadConfig(): Config {
   if (config.defaultBot && !config.bots[config.defaultBot]) {
     throw new Error(`telex: defaultBot "${config.defaultBot}" is not in bots`);
   }
-  return { defaultBot: config.defaultBot ?? names[0], bots: config.bots };
+  const queueExpirySeconds = config.queueExpirySeconds ?? DEFAULT_QUEUE_EXPIRY_SECONDS;
+  const questionTimeoutSeconds = config.questionTimeoutSeconds ?? DEFAULT_QUESTION_TIMEOUT_SECONDS;
+  for (const [key, value] of Object.entries({ queueExpirySeconds, questionTimeoutSeconds })) {
+    if (!Number.isSafeInteger(value) || value < 5 || value > 86400) {
+      throw new Error(`telex: ${key} must be an integer from 5 to 86400 seconds`);
+    }
+  }
+  return { ...config, defaultBot: config.defaultBot ?? names[0], queueExpirySeconds, questionTimeoutSeconds };
 }
 
 /**

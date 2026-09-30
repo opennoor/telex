@@ -66,10 +66,10 @@ async function waitForFirstMessage(api: ReturnType<typeof apiFor>) {
  * Install the MCP registration into the current project: confirm the directory, pick an
  * agent, then let that agent's CLI do it — or write the config file ourselves when it has none.
  */
-export async function installConfig(bot: string | undefined, flags: { agent?: string; scope?: string; yes?: boolean }) {
+export async function installConfig(bot: string | undefined, flags: { agent?: string; scope?: string; yes?: boolean; channel?: boolean }) {
   const dir = process.cwd();
   const list = agents();
-  const entry: Entry = { command: "telex", args: ["serve"], ...(bot ? { env: { TELEX_BOT: bot } } : {}) };
+  const entry: Entry = { command: "telex", args: ["serve", ...(flags.channel ? ["--channel"] : [])], ...(bot ? { env: { TELEX_BOT: bot } } : {}) };
 
   if (flags.scope && flags.scope !== "local" && flags.scope !== "project") throw new Error(`--scope takes "local" or "project"`);
   const interactive = !flags.agent && process.stdin.isTTY;
@@ -92,8 +92,9 @@ export async function installConfig(bot: string | undefined, flags: { agent?: st
       agent = list[pick - 1];
     }
 
+    if (flags.channel && agent.id !== "claude") throw new Error("--channel is supported only with --agent claude");
     if (agent.cli) {
-      const argv = agent.cli(bot);
+      const argv = agent.cli(bot, flags.channel);
       const result = runCli(argv, dir);
       if (result) {
         if (result.ok && bot) writeProjectConfig(bot);

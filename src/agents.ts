@@ -9,7 +9,7 @@ export type Agent = {
   id: string;
   label: string;
   /** Argv the agent's own CLI understands; preferred when the binary is on PATH. */
-  cli?: (bot?: string) => string[];
+  cli?: (bot?: string, channel?: boolean) => string[];
   /** Committed config file, and the gitignored variant when the agent has one. */
   file?: string;
   localFile?: string;
@@ -24,7 +24,7 @@ export function agents(): Agent[] {
   const std = (entry: Entry) => entry;
   return [
     { id: "claude", label: "Claude Code", file: ".mcp.json", path: ["mcpServers", "telex"], value: std,
-      cli: (bot) => ["claude", "mcp", "add", "--scope", "project", "telex", ...(bot ? ["--env", `TELEX_BOT=${bot}`] : []), "--", "telex", "serve"] },
+      cli: (bot, channel) => ["claude", "mcp", "add", "--scope", "project", "telex", ...(bot ? ["--env", `TELEX_BOT=${bot}`] : []), "--", "telex", "serve", ...(channel ? ["--channel"] : [])] },
     { id: "codex", label: "Codex CLI", file: ".codex/config.toml", localFile: ".codex/config.local.toml", toml: true },
   ];
 }

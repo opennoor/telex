@@ -242,12 +242,10 @@ export class BotSession {
     this.listening = false;
     this.watched.clear();
     this.ttl.clear();
+    if (this.idle) this.pollAbort?.abort();
   }
 
-  /**
-   * How long a message may sit unclaimed. Set from the agent's heartbeat interval, so until it
-   * checks in for the first time telex has no idea how long "too long" is and nothing expires.
-   */
+  /** How long a message may sit unclaimed after it is queued. */
   setInboxTtl(chatId: number | string, ms: number) {
     this.ttl.set(String(chatId), ms);
   }
@@ -345,7 +343,7 @@ export class BotSession {
           allowed_updates: ["message", "callback_query"],
         }, controller.signal);
       } catch (err) {
-        if (!this.pollingOwner) break;
+        if (!this.pollingOwner || !this.listening && this.idle) break;
         if (isPollingConflict(err)) {
           process.stderr.write(
             "telex: getUpdates conflict — another process is polling this bot token. " +
@@ -411,8 +409,7 @@ export class BotSession {
     if (watch.allowFrom?.length && !(msg.from && watch.allowFrom.includes(msg.from.id))) return;
     const message: Incoming = { message_id: msg.message_id, from_id: msg.from?.id, text: msg.text!, received_at: now };
     if (watch.accept && !watch.accept()) return watch.onRefused?.(message);
-    // The deadline is fixed when the message is queued, so any process can expire it without
-    // knowing whose interval set it. Before an agent declares one there is no deadline at all.
+    // The deadline is fixed when the message is queued, so any process can expire it after reconnect.
     const ttl = this.ttl.get(key);
     this.store.push(key, message, ttl === undefined ? undefined : now + ttl);
     watch.onQueued?.(message);
@@ -422,11 +419,14 @@ export class BotSession {
    * Drop whatever outlived the TTL. Runs on every poll, so a message expires even when the agent
    * has stopped checking in entirely — which is exactly when the user most needs telling.
    */
-  sweepInbox(now = Date.now()) {
+  sweepInbox(now = Date.now(), chatId?: number | string): Incoming[] {
+    // A non-polling process has no watch, but it may be the one collecting a shared queue.
+    if (chatId !== undefined) return this.store.expire(String(chatId), now);
     for (const [key, watch] of this.watched) {
       const expired = this.store.expire(key, now);
       if (expired.length) watch.onExpired?.(expired);
     }
+    return [];
   }
 }
 
