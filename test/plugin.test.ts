@@ -216,7 +216,8 @@ test("SessionStart before MCP readiness is spooled for its exact live host and S
   writeFileSync(preload, `import {appendFileSync} from 'node:fs'; let n=0;
     globalThis.fetch=async(url,options)=>{const method=String(url).split('/').at(-1),input=JSON.parse(options.body);
       if(method==='getUpdates') await new Promise(r=>setTimeout(r,10));
-      else appendFileSync(${JSON.stringify(log)},JSON.stringify(input)+'\\n');
+      else { if(input.text?.includes('session ended')) await new Promise(r=>setTimeout(r,1200));
+        appendFileSync(${JSON.stringify(log)},JSON.stringify(input)+'\\n'); }
       return {json:async()=>({ok:true,result:method==='getUpdates'?[]:{message_id:++n}})};};`);
   const input = { hook_event_name: "SessionStart", session_id: "spooled-host", cwd: dir };
   const client = new Client({ name: "spool-test", version: "1" });
@@ -233,7 +234,9 @@ test("SessionStart before MCP readiness is spooled for its exact live host and S
     await invokeCodexHook({ ...input, hook_event_name: "Stop" }, state);
     assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 0);
     await invokeCodexHook({ ...input, hook_event_name: "SessionEnd" }, state);
+    for (let n = 0; n < 100 && !calls().some((call) => call.text?.includes("session ended")); n++) await new Promise((resolve) => setTimeout(resolve, 20));
     assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 1);
+    await client.listTools();
     await client.close();
     assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 1);
   } finally { await client.close(); process.title = originalTitle; }
