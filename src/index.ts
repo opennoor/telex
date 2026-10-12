@@ -372,6 +372,9 @@ if (channelMode && !startup.bot.allowFrom?.length) throw new Error("telex: chann
 let hookHostId: string | undefined;
 const hookSocket = join(dirname(statePath()), `hook-${process.pid}-${randomUUID()}.sock`);
 const hookServer = createServer((connection) => {
+  connection.on("error", (error) => {
+    if ((error as NodeJS.ErrnoException).code !== "EPIPE") report(error);
+  });
   connection.setTimeout(1500, () => connection.destroy());
   let input = "";
   connection.on("data", async (chunk: Buffer) => {
@@ -392,7 +395,7 @@ const hookServer = createServer((connection) => {
         else response = { accepted: true, output: await handleHostHook(value) };
       }
     } catch (error) { report(error); }
-    connection.end(`${JSON.stringify(response)}\n`);
+    if (!connection.destroyed) connection.end(`${JSON.stringify(response)}\n`);
   });
 });
 mkdirSync(dirname(hookSocket), { recursive: true });
