@@ -1,6 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CodexRpc, CodexRejection, deliveryMethod } from "../src/codex.ts";
+import { createHash } from "node:crypto";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { CodexRpc, CodexRejection, deliveryMethod, codexStatePath, codexStatus, pendingCodex, recoverCodex } from "../src/codex.ts";
 
 test("Codex RPC handshakes, declines host approvals, and handles explicit rejection", async () => {
   const fake = `
@@ -41,4 +45,39 @@ test("Codex delivery uses idle start and active steer only with a known turn", (
   assert.equal(deliveryMethod("active", "turn-1"), "turn/steer");
   assert.throws(() => deliveryMethod("active"));
   assert.throws(() => deliveryMethod("notLoaded"));
+});
+
+
+test("legacy and mismatched Codex state fails closed before recovery can send or drain", async (t) => {
+  const project = mkdtempSync(join(tmpdir(), "telex-codex-binding-"));
+  const cwd = process.cwd();
+  const previous = { ...process.env };
+  t.after(() => {
+    process.chdir(cwd);
+    for (const key of ["TELEX_STATE", "TELEX_CONFIG", "TELEX_PROJECT_CONFIG", "TELEX_BOT"]) {
+      if (previous[key] === undefined) delete process.env[key]; else process.env[key] = previous[key];
+    }
+  });
+  process.chdir(project);
+  process.env.TELEX_STATE = join(project, "sessions.json");
+  process.env.TELEX_CONFIG = join(project, "config.json");
+  process.env.TELEX_PROJECT_CONFIG = join(project, "project.json");
+  delete process.env.TELEX_BOT;
+  writeFileSync(process.env.TELEX_CONFIG, JSON.stringify({ defaultBot: "work", bots: { work: { token: "test-token", chatId: 7, allowFrom: [42] } } }));
+  writeFileSync(process.env.TELEX_PROJECT_CONFIG, JSON.stringify({ bot: "work" }));
+  const bot = createHash("sha256").update("test-token").digest("hex");
+  const path = codexStatePath(project, bot);
+  const legacy = { threadId: "original", project, bot, outbox: [{ turnId: "uncertain", text: "saved answer", messages: [{ message_id: 1, text: "question", received_at: Date.now() }] }] };
+  writeFileSync(path, JSON.stringify(legacy));
+  assert.equal(codexStatus().state?.threadId, "original");
+  assert.throws(() => pendingCodex(), /no isolated route/);
+  await assert.rejects(recoverCodex(1, true), /no isolated route/);
+  for (const mismatch of [{ chatId: 8 }, { bot: "wrong-token-hash" }, { project: join(project, "other") }]) {
+    writeFileSync(path, JSON.stringify({ ...legacy, ...mismatch }));
+    assert.throws(() => codexStatus(), /binding differs/);
+    await assert.rejects(recoverCodex(1, true), /binding differs/);
+  }
+  writeFileSync(path, JSON.stringify({ ...legacy, chatId: 7, routeId: "another-thread", route: { id: "another-thread", chatId: 7, worktree: project } }));
+  assert.throws(() => pendingCodex(), /no isolated route/);
+  await assert.rejects(recoverCodex(1, true), /no isolated route/);
 });

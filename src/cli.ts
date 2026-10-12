@@ -2,7 +2,7 @@
 import { parseArgs, type ParseArgsConfig } from "node:util";
 import { fileURLToPath } from "node:url";
 import { execFileSync } from "node:child_process";
-import { existsSync, realpathSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { existsSync, realpathSync, mkdirSync, writeFileSync, unlinkSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { createHash } from "node:crypto";
 import { createInterface } from "node:readline/promises";
@@ -11,13 +11,16 @@ import { addBotInteractive, installConfig } from "./setup.ts";
 import { agents, snippet, type Entry } from "./agents.ts";
 import { wakeConfigPath, processStart, processCommand, processDescendsFrom, withWakeInputLock } from "./wake.ts";
 import { fileInbox, scopedInbox } from "./inbox.ts";
-import { apiFor, TelegramError } from "./telegram.ts";
-import { isLive, registeredSessions } from "./registry.ts";
+import { BotSession, apiFor, TelegramError } from "./telegram.ts";
+import { fileRoutes, type RouteRegistration } from "./routes.ts";
 import { codexStatus, disableCodex, pendingCodex, recoverCodex, runCodex } from "./codex.ts";
+import { serviceCommand } from "./service.ts";
 
 const USAGE = `telex — send messages from local AI agents to Telegram
 
   telex serve [--channel]             run the MCP server (stdio); --channel enables Claude push
+  telex daemon                       run the persistent Telegram listener
+  telex service install|start|stop|status|uninstall  manage the Linux user service
   telex add [name]                    add a bot, guided; or pass --token/--chat-id
   telex list                          show configured bots
   telex set <name> [options]          change a bot
@@ -100,6 +103,16 @@ function parseArgsFriendly<T extends ParseArgsConfig>(options: T): ReturnType<ty
 
 async function run(command: string, name?: string) {
   switch (command) {
+    case "daemon":
+      if (positionals.length !== 1) throw new Error("usage: telex daemon");
+      (await import("./daemon.ts")).runDaemon();
+      return;
+
+    case "service":
+      if (positionals.length !== 2) throw new Error("usage: telex service install|start|stop|status|uninstall");
+      console.log(serviceCommand(name, fileURLToPath(import.meta.url)));
+      return;
+
     case "serve":
       if (name) throw new Error("usage: telex serve [--channel]");
       await import("./index.ts");
@@ -240,6 +253,9 @@ async function codexCommand(action?: string) {
   throw new Error("usage: telex codex run|status|disable|pending|recover");
 }
 
+type WakeRecovery = { botHash: string; chatId: number | string; route: RouteRegistration };
+const wakeRecoveryPath = () => `${wakeConfigPath()}.recovery.json`;
+
 async function wakeCommand(action?: string) {
   const path = wakeConfigPath();
   if (action === "bind") {
@@ -264,20 +280,29 @@ async function wakeCommand(action?: string) {
       "wake needs Codex itself as the pane process; start it with `exec codex --no-daemon resume <session-id>`"
     );
     const botKey = createHash("sha256").update(bot.token).digest("hex");
-    const hostedHere = registeredSessions().some((entry) => {
-      try {
-        return entry.agent === "codex" && entry.bot === botKey && isLive(entry, Date.now()) &&
-          processDescendsFrom(entry.pid, pid);
-      } catch { return false; }
+    const hosted = fileRoutes(bot.token).active(bot.chatId).filter((route) => {
+      try { return route.provider === "codex" && route.worktree === resolve(process.cwd()) && !!route.pid && processDescendsFrom(route.pid, pid); }
+      catch { return false; }
     });
+    if (hosted.length > 1) throw new Error("multiple Codex routes are attached to this pane; finish the extra sessions before binding wake");
+    const hostedHere = hosted[0];
     if (!hostedHere) throw new Error(
       "wake needs a recently checked-in Telex MCP process under this Codex pane. " +
       "Default daemon-hosted Codex cannot bind. Install the current Telex release, then resume this saved " +
       "conversation with `exec codex --no-daemon resume <session-id>`, finish a turn, detach, and bind."
     );
-    const config = { socket: flags.socket, session, pane, pid, start: processStart(pid) };
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    const config = { socket: flags.socket, session, pane, pid, start: processStart(pid), routeId: hostedHere.id };
+    withWakeInputLock(() => {
+      if (existsSync(path)) throw new Error(`wake is already configured in ${path}; disable it first`);
+      let previous: WakeRecovery | undefined;
+      try { previous = JSON.parse(readFileSync(wakeRecoveryPath(), "utf8")); } catch { /* no prior enrollment */ }
+      if (previous && scopedInbox(fileInbox(), `${previous.botHash}:${previous.route.id}`).claimed(String(previous.chatId)).length) {
+        throw new Error("recover pending messages from the previous wake binding before enrolling another route");
+      }
+      mkdirSync(dirname(path), { recursive: true });
+      writeFileSync(wakeRecoveryPath(), JSON.stringify({ botHash: botKey, chatId: bot.chatId, route: hostedHere }), { mode: 0o600 });
+      writeFileSync(path, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    });
     console.log(`✓ Bound ${pane} in detached tmux session ${session}. Telex will use its last idle Stop hook if still fresh.`);
     return;
   }
@@ -287,7 +312,18 @@ async function wakeCommand(action?: string) {
     return;
   }
   const { bot } = pickBot(loadConfig());
-  const store = scopedInbox(fileInbox(), createHash("sha256").update(bot.token).digest("hex"));
+  let recovery: WakeRecovery;
+  try { recovery = JSON.parse(readFileSync(wakeRecoveryPath(), "utf8")); }
+  catch {
+    if (action === "pending") return;
+    throw new Error("no saved wake recovery binding; enroll a route with telex wake bind first");
+  }
+  if (recovery.botHash !== createHash("sha256").update(bot.token).digest("hex") || String(recovery.chatId) !== String(bot.chatId) ||
+      recovery.route?.provider !== "codex" || recovery.route.worktree !== resolve(process.cwd()) ||
+      typeof recovery.route.id !== "string" || String(recovery.route.chatId) !== String(bot.chatId)) {
+    throw new Error("wake recovery binding differs from this bot/chat/worktree; use the original project and configuration");
+  }
+  const store = scopedInbox(fileInbox(), `${recovery.botHash}:${recovery.route.id}`);
   if (action === "pending") {
     for (const message of store.claimed(String(bot.chatId))) console.log(`${message.message_id}\t${message.text}`);
     return;
@@ -302,7 +338,9 @@ async function wakeCommand(action?: string) {
     if (!message) throw new Error(`no pending wake claim for message ${id}`);
     if (message.receipt_id) {
       try {
-        await apiFor(bot.token)("editMessageText", {
+        const sender = new BotSession(apiFor(bot.token));
+        sender.setRoute({ ...fileRoutes(bot.token), register() {} }, { ...recovery.route, expiresAt: 0 });
+        await sender.api("editMessageText", {
           chat_id: bot.chatId, message_id: message.receipt_id,
           text: flags.retry ? "🕦 <i>Held for the agent's next check-in.</i>" : "📬 <i>Submitted to Codex.</i>", parse_mode: "HTML",
         });

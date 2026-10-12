@@ -40,7 +40,7 @@ test("channel pushes idle and active messages and waits for explicit acknowledge
   const launch = () => new StdioClientTransport({
     command: process.execPath, args: ["--import", preload, cli, "serve", "--channel"], cwd: dir,
     env: { ...process.env, TELEX_CONFIG: config, TELEX_PROJECT_CONFIG: join(dir, ".telex.json"),
-      TELEX_STATE: join(dir, "sessions.json"), TELEX_INBOX: inbox },
+      TELEX_STATE: join(dir, "sessions.json"), TELEX_INBOX: inbox, TELEX_SESSION_ID: "channel-test-identity" },
   });
   await client.connect(launch());
   const event = async (id: number, text: string, ack = true) => {

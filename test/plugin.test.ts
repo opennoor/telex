@@ -10,6 +10,8 @@ import { fileURLToPath } from "node:url";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 
+import { processAncestors } from "../src/host.ts";
+
 const root = join(process.cwd(), "plugins/telex");
 
 function invokeCodexHook(input: object, state: string) {
@@ -54,7 +56,9 @@ test("Codex command hook stays silent without Telex and resumes over its local s
       socket.on("data", (chunk) => {
         request += chunk;
         if (!request.includes("\n")) return;
-        received = JSON.parse(request.slice(0, request.indexOf("\n")));
+        const value = JSON.parse(request.slice(0, request.indexOf("\n")));
+        if (value.probe) { socket.end(`${JSON.stringify({ eligible: true, bound: true, ancestors: processAncestors(process.pid) })}\n`); return; }
+        received = value;
         socket.end(`${JSON.stringify({ accepted: true, output: {
           hookSpecificOutput: { hookEventName: "UserPromptSubmit", additionalContext: "Telegram message" },
         } })}\n`);
@@ -151,14 +155,14 @@ test("host plugins register one MCP server and one explicit hook file", () => {
     assert.equal(manifest.hooks, hookPath);
 
     const config = JSON.parse(readFileSync(join(root, hookPath), "utf8"));
-    assert.deepEqual(Object.keys(config.hooks).sort(), ["PostToolUse", "Stop", "UserPromptSubmit"]);
+    assert.deepEqual(Object.keys(config.hooks).sort(), ["PostToolUse", "SessionEnd", "SessionStart", "Stop", "UserPromptSubmit"]);
     for (const event of Object.keys(config.hooks)) {
       const [group] = config.hooks[event];
       assert.equal(group.hooks.length, 1);
-      assert.deepEqual(group.hooks[0], host === "codex" ? {
+      assert.deepEqual(group.hooks[0], host === "codex" || event === "SessionStart" || event === "SessionEnd" ? {
         type: "command",
-        command: 'node "${PLUGIN_ROOT}/hooks/codex.mjs"',
-        timeout: 3,
+        command: host === "claude" ? 'node "${CLAUDE_PLUGIN_ROOT}/hooks/codex.mjs" claude-code' : 'node "${PLUGIN_ROOT}/hooks/codex.mjs"',
+        timeout: event === "SessionEnd" ? 1.5 : 3,
       } : {
         type: "mcp_tool",
         server,
@@ -173,4 +177,64 @@ test("host plugins register one MCP server and one explicit hook file", () => {
       });
     }
   }
+});
+
+test("same-worktree command hooks never guess between equally eligible conversations", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "telex-hook-ambiguous-"));
+  const servers = [];
+  let deliveries = 0;
+  for (let i = 0; i < 2; i++) {
+    const server = createServer((socket) => {
+      socket.once("data", (chunk) => {
+        const input = JSON.parse(chunk.toString().trim());
+        if (!input.probe) deliveries++;
+        socket.end(`${JSON.stringify(input.probe ? { eligible: true, bound: false, ancestors: processAncestors(process.pid) } : { accepted: true })}\n`);
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(join(dir, `hook-${process.pid}-${randomUUID()}.sock`), resolve));
+    servers.push(server);
+  }
+  try {
+    const result = await invokeCodexHook({ hook_event_name: "PostToolUse", session_id: "new-thread", cwd: dir }, join(dir, "sessions.json"));
+    assert.equal(result.stdout, "");
+    assert.equal(deliveries, 0);
+  } finally { for (const server of servers) await new Promise<void>((resolve) => server.close(() => resolve())); }
+});
+
+test("SessionStart before MCP readiness is spooled for its exact live host and SessionEnd closes once", async (t) => {
+  if (process.platform !== "linux") { t.skip("exact process-start spool verification uses Linux /proc"); return; }
+  const originalTitle = process.title;
+  process.title = "codex";
+  const dir = mkdtempSync(join(tmpdir(), "telex-start-spool-"));
+  const state = join(dir, "sessions.json");
+  const config = join(dir, "config.json");
+  const log = join(dir, "calls.jsonl");
+  const preload = join(dir, "telegram.mjs");
+  writeFileSync(config, JSON.stringify({ bots: { main: { token: "123:test", chatId: 7 } } }));
+  writeFileSync(join(dir, ".telex.json"), JSON.stringify({ bot: "main" }));
+  writeFileSync(log, "");
+  writeFileSync(preload, `import {appendFileSync} from 'node:fs'; let n=0;
+    globalThis.fetch=async(url,options)=>{const method=String(url).split('/').at(-1),input=JSON.parse(options.body);
+      if(method==='getUpdates') await new Promise(r=>setTimeout(r,10));
+      else appendFileSync(${JSON.stringify(log)},JSON.stringify(input)+'\\n');
+      return {json:async()=>({ok:true,result:method==='getUpdates'?[]:{message_id:++n}})};};`);
+  const input = { hook_event_name: "SessionStart", session_id: "spooled-host", cwd: dir };
+  const client = new Client({ name: "spool-test", version: "1" });
+  try {
+    const start = await invokeCodexHook(input, state);
+    assert.match(JSON.parse(start.stdout).hookSpecificOutput.additionalContext, /choice buttons/);
+    await client.connect(new StdioClientTransport({ command: process.execPath,
+      args: ["--import", preload, fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), "serve"], cwd: dir,
+      env: { ...process.env, TELEX_STATE: state, TELEX_CONFIG: config, TELEX_PROJECT_CONFIG: join(dir, ".telex.json") } }));
+    for (let n = 0; n < 100 && !readFileSync(log, "utf8").includes("session started"); n++) await new Promise((resolve) => setTimeout(resolve, 20));
+    const calls = () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    assert.equal(calls().filter((call) => call.text?.includes("session started")).length, 1);
+    assert.match(calls()[0].text, /main · codex/);
+    await invokeCodexHook({ ...input, hook_event_name: "Stop" }, state);
+    assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 0);
+    await invokeCodexHook({ ...input, hook_event_name: "SessionEnd" }, state);
+    assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 1);
+    await client.close();
+    assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 1);
+  } finally { await client.close(); process.title = originalTitle; }
 });

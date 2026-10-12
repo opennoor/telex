@@ -1,10 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { touch, release, isLive, repoOf, ownerOf, statePath, type Session } from "../src/registry.ts";
+import { touch, release, isLive, repoOf, ownerOf, statePath, registeredSessions, type Session } from "../src/registry.ts";
 
 function isolated() {
   process.env.TELEX_STATE = join(mkdtempSync(join(tmpdir(), "telex-")), "sessions.json");
@@ -174,4 +174,31 @@ test("ownership is per bot", (t) => {
 
   assert.equal(ownerOf("work"), SESSION, "another bot's owner is irrelevant");
   assert.equal(ownerOf("nobody"), undefined, "a bot with no live session has no owner");
+});
+
+test("the central daemon takes polling priority over existing agent registrations", (t) => {
+  isolated();
+  t.after(() => { release(SESSION); release(OTHER); });
+  touch(entry({ agent: "codex" }));
+  touch(entry({ session_id: OTHER, agent: "telex-daemon" }));
+  assert.equal(ownerOf("work"), OTHER);
+});
+
+
+test("simultaneous process registrations cannot overwrite each other's sessions", async (t) => {
+  isolated();
+  const children: ReturnType<typeof spawn>[] = [];
+  t.after(() => { for (const child of children) child.kill(); });
+  await Promise.all(Array.from({ length: 5 }, (_, index) => new Promise<void>((resolve, reject) => {
+    const source = `import {touch} from ${JSON.stringify(new URL("../src/registry.js", import.meta.url).href)};
+      touch({session_id:"parallel-${index}",bot:"work",project:"/repo",repo:"/repo",agent:"test",pid:process.pid,interval_seconds:60});
+      process.stdout.write("ready");setInterval(()=>{},1000);`;
+    const child = spawn(process.execPath, ["--input-type=module", "-e", source], { env: process.env, stdio: ["ignore", "pipe", "pipe"] });
+    children.push(child);
+    child.once("error", reject);
+    child.stdout!.once("data", () => resolve());
+    child.once("exit", (code) => { if (code) reject(new Error(`child registration failed: ${code}`)); });
+  })));
+  assert.equal(registeredSessions().length, 5);
+  assert.equal(new Set(registeredSessions().map((session) => session.session_id)).size, 5);
 });
