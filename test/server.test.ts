@@ -96,7 +96,7 @@ test("a waiting question takes over polling when the owner exits", async (t) => 
   t.after(async () => { await owner.close(); await asker.close(); });
   const hook = { event: "UserPromptSubmit", host_session_id: "thr_test", project_path: dir, agent: "codex" };
   await owner.callTool({ name: "host_hook", arguments: hook });
-  await asker.callTool({ name: "host_hook", arguments: hook });
+  await asker.callTool({ name: "host_hook", arguments: { ...hook, host_session_id: "thr_asker" } });
   const pending = asker.callTool({ name: "send_to_user", arguments: {
     project: "test", message: "Continue?", options: ["Yes"], timeout_seconds: 5,
     project_path: dir, agent: "codex", interval_seconds: 60,

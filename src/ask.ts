@@ -58,7 +58,7 @@ export async function ask(session: BotSession, chatId: number | string, input: A
       : [];
 
   // Only the final chunk carries the keyboard, so the buttons sit under the whole question.
-  const chunks = chunk(text);
+  const chunks = chunk(text, session.messageCapacity);
   let sent!: { message_id: number };
   for (const [i, part] of chunks.entries()) {
     sent = await send(session, chatId, part, i === chunks.length - 1 ? keyboard : []);

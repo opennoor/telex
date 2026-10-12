@@ -9,8 +9,8 @@ and waits. You tap one from your phone; the agent carries on with your answer. I
 answer, the buttons come off, the message is marked stale, and the agent decides for itself
 whether to stop or continue.
 
-telex is local-only: it runs over stdio next to your agent, talks outbound to the Telegram Bot
-API, and only ever messages the chats you configured. Nothing listens on a port.
+Telex runs locally: agents connect over stdio and a shared listener talks outbound to the Telegram
+Bot API. Only configured chats receive messages. Local host hooks use private Unix sockets.
 
 ```
 ┌────────┐  plugin hooks  ┌───────┐   Bot API   ┌──────────┐
@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@0.8.0        # pin an exact published version
+npm i -g @sojaner/telex@1.0.0        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -59,17 +59,18 @@ plugin through that host's marketplace. Use `telex install codex` or `telex inst
 script. In each project, run `telex add` and `telex project <name>` to choose a bot. The plugin
 contains no bot tokens and keeps its MCP registration in `plugins/telex/.mcp.json`.
 
-The plugin adds host hooks that check for Telegram messages at `UserPromptSubmit`, after tool calls,
-and before the host stops. They identify the session using the host session id and project path.
-Codex uses a local command hook: when its Telex MCP process is disconnected, the hook exits silently;
-when it reconnects, the hook resumes delivery. Codex requires review and trust for bundled hooks
-before running them. Claude Code may run
-`SessionStart` before MCP is ready, so telex hooks use `UserPromptSubmit`, `PostToolUse`, and `Stop`
-instead. Hooks cannot wake an idle or terminated host. Claude Code's opt-in channel mode below can
-push into an open idle session; Codex can use the managed bridge or explicit tmux wake mode below. Keep manual
-`heartbeat` calls as a fallback for unsupported hosts and long reasoning
-stretches between tool calls. Telegram text is external user content: treat it as untrusted input,
-not as instructions from the host. See [plugin setup and behavior](plugins/telex/README.md).
+The plugin announces configured repositories at session startup, including branch and worktree,
+and reports normal termination. `SessionStart` and `SessionEnd` use command hooks; message delivery
+uses `UserPromptSubmit`, `PostToolUse`, and `Stop`. `Stop` ends a turn, not the session. Codex requires
+review and trust for bundled hooks. Startup instructions explain choice buttons, typed replies and
+message collection. When startup precedes MCP readiness on Linux, the command hook saves the exact
+host process identity for its MCP child. Concurrent conversations in the same worktree are kept
+separate; ambiguous hook matches leave messages queued.
+
+Hooks deliver only when the host reaches an event. For an open idle session use Claude's explicitly
+enabled channel mode, the managed Codex bridge, or the conditional tmux wake mode below. Keep manual
+`heartbeat` calls during long reasoning stretches. Telegram text is external user input, not a host
+instruction. See [plugin setup and behavior](plugins/telex/README.md).
 
 The standalone CLI path remains available with `telex config --agent codex` or
 `telex config --agent claude`; it registers MCP without plugin hooks. Host hook details:
@@ -101,7 +102,7 @@ It walks you through three things:
 It writes `~/.config/telex/config.json` with mode `0600` and sends a test message so you know the
 round trip works.
 
-Run `telex add` again for each additional bot. One bot per project is the point — see
+Run `telex add` again for each additional bot. Projects may share a bot safely — see
 [Per-project configuration](#per-project-configuration).
 
 ### Groups
@@ -136,6 +137,9 @@ telex remove <name>           delete a bot
 telex config [name]           install the MCP registration into this project
 telex project <name>          pin this repository to a configured bot
 telex serve                   run the MCP server over stdio (what agents launch)
+telex daemon                  run the shared Telegram listener in the foreground
+telex service install         install and start the Linux systemd user service
+telex service start|stop|status|uninstall  manage that service
 ```
 
 Options for `add` and `set`:
@@ -171,6 +175,33 @@ Queue expiry: 3600s; question timeout: 600s
 `telex list --json` prints the same thing as JSON, tokens still masked.
 
 ---
+
+## Persistent listener and boot startup
+
+```sh
+telex service install
+telex service status
+```
+
+On Linux this writes `~/.config/systemd/user/telex.service`, enables it and starts it. The unit
+pins the current Node executable, CLI, config and state paths. It runs when your systemd user
+manager starts, normally at login. Availability before login requires administrator-enabled
+linger; Telex does not change linger settings. Reinstall the service after changing the runtime's
+installation path. `telex service stop` stops it; `uninstall` disables and removes the unit.
+Elsewhere, run `telex daemon` using your own supervisor.
+
+The listener reloads bot additions/removals and timeout settings every five seconds. Update cursors,
+reply destinations and held messages survive listener restarts. One exclusive poll lease per token
+prevents overlapping `getUpdates`; connected MCP processes take over if the listener is unavailable.
+A daemon keeps Telegram reachable but cannot start a terminated AI host. With no connected session,
+messages are rejected clearly.
+
+Configured repositories announce their session before the model's first tool call. Generic MCP
+connections initially identify as `mcp`, then refine that identity when the host checks in without
+creating a second lifetime. Normal disconnects report termination; the listener detects crashed
+processes by PID and process start identity, not an idle timeout. Notification attempts are durable:
+an uncertain Telegram send is not replayed automatically, so a network failure or crash during the
+send can omit a notice. Keep the listener running for crash notices after all MCP processes exit.
 
 ## The config file
 
@@ -274,8 +305,9 @@ use the absolute path, or point Node at the installed entry point:
 
 ### Per-project configuration
 
-Give each project its own bot, so a message tells you which project it came from before you even
-read it, and you can mute one project's bot without muting the rest.
+Choose a project bot when you want separate chats or mute settings. The global default supports
+full questions, buttons and replies from any connected session. Every outgoing message identifies
+its bot, provider, session, repository, branch and worktree.
 
 ```sh
 cd ~/code/acme-api
@@ -383,18 +415,19 @@ a single receipt under your message as it moves:
 | What you see | What it means |
 |---|---|
 | 🕦 *Held for the agent's next check-in.* | telex has your message and is holding it. |
-| ‼️ *Not accepted — no agent has checked in for this project yet.* | The server is running but no agent has identified itself. Nothing is holding your message. |
+| *No connected session / stale destination* | The listener cannot deliver to a live session. Nothing is silently assigned elsewhere. |
 | 📬 *Delivered to the agent.* | A host hook or heartbeat collected it; the agent has it now. |
 | 🗑️ *Expired — the agent never picked this up.* | The configured queue expiry passed without collection. Dropped. |
-| *nothing at all* | Nothing is running for that project. The message went nowhere. |
+| *nothing at all* | Neither the listener nor a connected MCP process is polling this bot. |
 
-Silence is the signal: telex only polls while its process is alive, so a message with no receipt
-at all means no agent is there to receive it. Held messages are capped at 50 per chat, oldest
-dropped.
+Reply to any Telex message to address its exact session. Plain text goes directly to the sole
+connected session; with several destinations, Telex displays a session selector. The sender and
+chat are checked again when a selection is tapped. Ended sessions and stale buttons are rejected.
+Held messages are capped at 50 per session/chat, oldest unclaimed messages dropped.
 
 #### Claude Code channel mode
 
-[Claude Code Channels](https://code.claude.com/docs/en/channels-reference) can inject Telegram
+[Claude Code Channels](https://code.claude.com/docs/en/channels) can inject Telegram
 messages into an open session while it is active or idle. They are in research preview and require
 an explicit host opt-in. Configure a nonempty `allowFrom` sender list, then register the standalone
 MCP server for this project and start Claude Code with the channel enabled:
@@ -408,10 +441,13 @@ Use this standalone registration without the bundled Claude plugin in the same s
 hook process does not collect messages before the channel receives them. The long-lived Telex MCP
 process polls Telegram once and emits a channel event when an allowed message arrives. After
 reading an event, Claude calls `ack_channel_message` with its `delivery_id`; Telex then marks the
-Telegram receipt delivered. If the process disconnects first, the same event replays on reconnect.
+Telegram receipt delivered. Set a unique, stable `TELEX_SESSION_ID` in that MCP registration to replay unacknowledged events
+after reconnecting the same conversation. A fresh anonymous connection cannot collect another
+session's held events. Never share that identity between simultaneously connected conversations.
 If the host blocks or drops channel events, Telex cannot detect that through MCP, so the receipt
 stays held. `send_to_user` remains available for replies and questions. Organization policy may
-also need to enable channels.
+also need to enable channels and the preview/plugin allowlist. An ordinary MCP connection can
+succeed while the host blocks channels; registration alone does not enable realtime delivery.
 
 #### Codex managed bridge
 
@@ -426,8 +462,8 @@ telex project bridge
 telex codex run
 ```
 
-Use a separate bot from a concurrently running Telex MCP session. The bridge refuses to start when
-another live Telex session already owns that bot. Manage it with `telex codex status`,
+The bridge has its own durable thread/worktree destination and can share a bot with other sessions.
+Two worktrees keep separate saved bridge state; starting again in the same worktree resumes its thread. Manage it with `telex codex status`,
 `telex codex disable`, and `telex codex pending`. A successful app-server RPC marks the Telegram
 receipt delivered. If the RPC connection fails after submission, Telex holds the claim because it
 cannot tell whether Codex accepted it. Inspect the bridge's printed thread ID, disable the bridge,
@@ -458,7 +494,7 @@ Codex plugin from another terminal, then check that `telex list` shows nonempty 
 your bot:
 
 ```sh
-npm i -g @sojaner/telex@0.8.0
+npm i -g @sojaner/telex@1.0.0
 telex install codex
 telex list
 ```
@@ -474,7 +510,7 @@ exec codex --no-daemon resume <session-id>
 server; installing the package cannot reload an already-running MCP process. `exec` makes Codex
 the pane process rather than leaving a shell underneath it. If the old pane closed on exit, create
 a new dedicated tmux pane and run the same `exec codex --no-daemon resume <session-id>` command in
-it. Finish a new turn so the v0.8.0 Telex server sees a fresh `Stop` hook, then detach. On a new
+it. Finish a new turn so the v1.0.0 Telex server sees a fresh `Stop` hook, then detach. On a new
 conversation, start it directly with
 `exec codex --no-daemon` and likewise finish a turn before binding.
 
@@ -511,8 +547,10 @@ telex wake recover 123 --delivered  # only if Codex accepted that message
 telex wake recover 123 --retry      # only if it did not; choose one action
 ```
 
-Recovery updates the Telegram receipt and either removes the confirmed claim or returns the
-message to the normal queue. Rebind the detached pane after recovery if you want wake again.
+Recovery retains the enrolled route identity after `disable`; run pending/recover from its original
+worktree with the original bot token/chat configuration. It updates the tagged Telegram receipt and
+either removes the confirmed claim or returns it to that exact session queue. Rebinding is blocked
+until previous uncertain claims are resolved. Rebind the detached pane after recovery if needed.
 
 ### `heartbeat`
 
@@ -537,37 +575,17 @@ takes over polling.
 
 ### Who is calling
 
-Every tool call carries `project_path`, `agent` and `interval_seconds`, and every result hands back
-a `session_id` for the agent to echo on its next call. That does four things:
+Every tool call carries `project_path`, `agent` and `interval_seconds`; echo the returned
+`session_id` on later calls. Each connection has its own route and queue, including separate
+worktrees and providers sharing one bot/chat. Replies and question callbacks retain that exact
+destination across listener restarts. A connected process cannot silently take over another live
+session's identity. Host session ids remain stable across MCP reconnects; plain MCP clients can
+set `TELEX_SESSION_ID` to an identity unique to that conversation.
 
-- **The queue starts at the first call**, not the first heartbeat. A message you send a
-  second later already has a deadline.
-- **Messages sent before any agent has checked in are refused**, not held. The server starts with
-  your agent, but until the agent actually calls a telex tool nothing owns the bot — telex says so
-  rather than quietly stockpiling messages for an agent that may never ask.
-- **One session stays one agent.** The `session_id` is what telex matches on, not the name or the
-  process. A session that renames itself mid-run — a subagent taking over a heartbeat, a handoff
-  between models — is still the same agent, not a second one competing for the bot. An agent that
-  never echoes it still gets one stable identity for the life of the server process.
-- **Two projects on one bot get caught.** Each running process records itself in
-  `~/.local/state/telex/sessions.json` (override with `TELEX_STATE`), so separate telex processes
-  can see each other. When a second one appears on the same bot you get:
-
-  > ⚠️ **Two projects are using this bot at once**
-  > `claude-code` — `/code/acme-api`
-  > `codex` — `/code/other`
-  > Messages in this chat cannot be routed reliably between projects.
-
-  Telex elects one poller for a bot token and shares its queue with other processes, but an
-  unsolicited message in a shared chat has no project address. Give each project its own bot.
-
-Worktrees are exempt. Agents in `~/code/acme` and `~/code/acme.worktrees/fix` resolve to the same
-repository, so they count as one project and no warning fires. One process polls the bot, and
-the processes share inbound messages and question answers. Give a long-running worktree its own
-bot when its unsolicited messages need separate routing.
-
-A running process keeps poll ownership even during a long stretch without hooks. Conflict warnings
-only show recently checked-in projects; dead processes are pruned on the next registry update.
+The local state directory (`~/.local/state/telex`, or the directory containing `TELEX_STATE`)
+holds registrations, queues, routing and lifecycle records. Idle processes remain alive; sparse
+heartbeats never count as a crash. Only one process polls each token, with the persistent listener
+taking priority over the standalone MCP fallback.
 
 ### Examples
 
@@ -615,15 +633,14 @@ A notification, no answer wanted:
 - **Slash commands are ignored** as text answers, so `/start` and friends still work.
 - **Rate limits** are honoured: a `429` is retried after the `retry_after` Telegram asks for.
 - **Tokens are redacted** from error messages; they appear in the API URL that failed.
-- **Polling runs while the process does.** Once a project's bot is watched telex long-polls for
-  the life of the server, because being reachable is what makes "delivered" mean anything. Kill
-  the agent and the bot goes quiet.
+- **The listener outlives agents.** It polls configured bots until stopped. Session delivery still
+  needs a connected host; the standalone MCP fallback polls only while connected.
 - **Unprompted messages are held, not answered with.** A message you send while nothing is asking
   is queued for the agent instead of being read as the answer to whatever gets asked next.
 - **`allowFrom` covers inbound too.** Someone else in the group messaging the bot is dropped, not
   queued.
-- **One poller per token.** Two processes polling the same bot fight over updates; give telex its
-  own bot. It says so explicitly if it detects a conflict.
+- **One poller per token.** Telex sessions share the listener and an exclusive polling lease. An
+  unrelated application using the same bot can still cause Telegram polling conflicts.
 
 ---
 
@@ -646,13 +663,13 @@ A notification, no answer wanted:
 | `no bots configured` | Run `telex add`, or point `TELEX_CONFIG` at the right file. |
 | `Telegram rejected that token` | Paste the whole BotFather line, including the digits before the colon. |
 | Nothing arrives, no error | Wrong `chatId`, or you never messaged the bot. Check with `telex list`. |
-| `getUpdates conflict` | Another process is polling the same token. Give telex its own bot. |
+| `getUpdates conflict` | An unrelated application is polling the same token; stop that poller or use a dedicated bot. Telex sessions can share a bot. |
 | Agent can't start the server | `telex` isn't on its `PATH`; use the absolute `node …/dist/index.js` form. |
 | Buttons do nothing | The tapping account isn't in `allowFrom`. `telex set <name> --allow <id>`. |
-| You message the bot, nothing replies | Nothing is running for that project — start the agent. That silence is deliberate. |
+| You message the bot, nothing replies | Check `telex service status` and start the target agent. |
 | Messages stay "held" | The agent isn't calling `heartbeat`. It will still see them on its next tool call. |
-| Everything is "not accepted" | The agent hasn't called any telex tool yet, so nothing owns the bot. |
-| Warned about two agents | Two projects share one bot. `telex add <name>` and repoint one of them. |
+| No connected session | Connect the target MCP/host session; the listener cannot launch it. |
+| A session selector appears | Several live destinations share this chat; choose the intended session. |
 | Messages expire too soon | Increase queue expiry with `telex set-timeouts --queue-expiry <seconds>`. |
 
 Run the server by hand to see startup errors that an agent would swallow:

@@ -6,9 +6,10 @@ import { lstatSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { fileInbox } from "../src/inbox.ts";
+import { fileInbox, scopedInbox } from "../src/inbox.ts";
 import { Wake, fitsWidth, probe, promptFor, submitToPane, wakeTargetFromConfig } from "../src/wake.ts";
 import { BotSession, type Incoming } from "../src/telegram.ts";
+import { fileRoutes } from "../src/routes.ts";
 import { touch } from "../src/registry.ts";
 
 const tmux = (socket: string, ...args: string[]) =>
@@ -29,7 +30,7 @@ async function fixture() {
   const stat = readFileSync(`/proc/${process.pid}/stat`, "utf8");
   const start = stat.slice(stat.lastIndexOf(")") + 2).split(" ")[19];
   const info = lstatSync(socket);
-  const target = { socket, session, pane, pid: process.pid, start, socketId: `${info.dev}:${info.ino}` };
+  const target = { socket, session, pane, pid: process.pid, start, socketId: `${info.dev}:${info.ino}`, routeId: "fixture-route" };
   const screen = (text: string, shortcut = "? for shortcuts  ⚠ 1 warning · f2 to view") => process.stdout.write(
     `\x1b[2J\x1b[H${text}\n  GPT-6-Luna default\n  ${shortcut}\n`
   );
@@ -72,6 +73,17 @@ async function fixture() {
   const mcp = spawn("sleep", ["300"], { stdio: "ignore" });
   touch({ session_id: "fixture", bot: createHash("sha256").update("123:test").digest("hex"),
     project: process.cwd(), agent: "codex", pid: mcp.pid!, interval_seconds: 60 });
+  fileRoutes("123:test").register({ id: "fixture-route", chatId: 7, provider: "codex", repo: process.cwd(),
+    branch: "main", worktree: process.cwd(), pid: mcp.pid! });
+  bind();
+  const recovery = JSON.parse(readFileSync(`${process.env.TELEX_WAKE_CONFIG}.recovery.json`, "utf8"));
+  assert.equal(recovery.route.id, "fixture-route");
+  execFileSync(process.execPath, [fileURLToPath(new URL("../../dist/cli.js", import.meta.url)), "wake", "disable"], { env: process.env });
+  const pending = scopedInbox(fileInbox(), `${recovery.botHash}:fixture-route`);
+  pending.push("7", message(99, "uncertain previous paste"));
+  pending.claim("7", "old-wake-claim", () => true);
+  assert.throws(bind, /recover pending messages/, "rebind preserves unresolved previous route claims");
+  pending.resolve("7", 99, false);
   bind();
   mcp.kill();
   assert.deepEqual(wakeTargetFromConfig(), target, "enrollment resolves this exact pane");
@@ -239,7 +251,7 @@ if (process.env.TELEX_WAKE_WORKER) {
       const script = fileURLToPath(import.meta.url);
       tmux(socket, "new-session", "-d", "-s", "wake_test", "-x", "100", "-y", "24", `exec env TELEX_WAKE_FIXTURE_DIR='${dir}' '${codex}' '${script}'`);
       let result = "";
-      for (let n = 0; n < 200; n++) {
+      for (let n = 0; n < 600; n++) {
         try { result = readFileSync(join(dir, "result"), "utf8"); break; } catch { await sleep(25); }
       }
       assert.equal(result, "ok", result || `tmux fixture timed out: ${tmux(socket, "capture-pane", "-p", "-t", "wake_test")}`);

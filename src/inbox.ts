@@ -7,9 +7,9 @@
  * happens to send something of its own. A message belongs to the bot and chat it arrived on, not
  * to whichever process happened to be listening.
  */
-import { closeSync, mkdirSync, openSync, readFileSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { statePath } from "./registry.ts";
+import { statePath, withStateLock } from "./registry.ts";
 import type { Incoming } from "./telegram.ts";
 
 /** A queued message plus the deadline the queueing process gave it. */
@@ -68,59 +68,12 @@ const write = (held: Held[]) => {
   renameSync(tmp, path);
 };
 
-/**
- * Exclusive-create is the portable atomic primitive, and a queue needs one: a read-modify-write
- * racing another can drop a message, and a dropped message is the user's, not ours.
- *
- * ponytail: a bounded synchronous spin. Only the bot's owner pushes and heartbeats are seconds
- * apart, so contention is rare; if that changes, move the store behind an async interface.
- */
-function withLock<T>(fn: () => T): T {
-  const lock = `${inboxPath()}.lock`;
-  mkdirSync(dirname(lock), { recursive: true });
-  const deadline = Date.now() + 2000;
-  let held = false;
-  while (Date.now() < deadline) {
-    try {
-      const fd = openSync(lock, "wx");
-      held = true;
-      try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
-      break;
-    } catch (err) {
-      if (held) {
-        try { unlinkSync(lock); } catch { /* failed acquisition already owns no data */ }
-        throw err;
-      }
-      // A lock left behind by a crash must not wedge every agent on the machine.
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 10_000) {
-          const owner = Number(readFileSync(lock, "utf8"));
-          let alive = false;
-          try { if (owner > 0) { process.kill(owner, 0); alive = true; } }
-          catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; }
-          if (!alive) unlinkSync(lock);
-        }
-      } catch {
-        // it went away on its own
-      }
-      const until = Date.now() + 20;
-      while (Date.now() < until);
-    }
-  }
-  if (!held) throw new Error("telex: inbox lock timed out");
-  try {
-    return fn();
-  } finally {
-    try { unlinkSync(lock); } catch { /* already gone */ }
-  }
-}
-
 /** The queue every telex process on this machine shares. */
 export function fileInbox(): InboxStore {
   const strip = ({ key: _key, expires_at: _expires, wake_claim: _claim, ...message }: Held): Incoming => message;
   return {
     push(key, message, expiresAt) {
-      withLock(() => {
+      withStateLock(inboxPath(), () => {
         const existing = read();
         if (existing.some((m) => m.key === key && m.message_id === message.message_id && m.wake_claim)) return;
         const held = existing.filter((m) => !(m.key === key && m.message_id === message.message_id));
@@ -131,14 +84,14 @@ export function fileInbox(): InboxStore {
       });
     },
     take(key) {
-      return withLock(() => {
+      return withStateLock(inboxPath(), () => {
         const held = read();
         write(held.filter((m) => m.key !== key || m.wake_claim));
         return held.filter((m) => m.key === key && !m.wake_claim).map(strip);
       });
     },
     expire(key, now) {
-      return withLock(() => {
+      return withStateLock(inboxPath(), () => {
         const held = read();
         const dead = held.filter((m) => m.key === key && !m.wake_claim && m.expires_at !== undefined && now > m.expires_at);
         if (dead.length) write(held.filter((m) => !dead.includes(m)));
@@ -146,7 +99,7 @@ export function fileInbox(): InboxStore {
       });
     },
     receipt(key, messageId, receiptId) {
-      withLock(() => {
+      withStateLock(inboxPath(), () => {
         const held = read();
         const found = held.find((m) => m.key === key && m.message_id === messageId);
         if (!found) return;
@@ -155,7 +108,7 @@ export function fileInbox(): InboxStore {
       });
     },
     claim(key, id, accept) {
-      return withLock(() => {
+      return withStateLock(inboxPath(), () => {
         const held = read();
         if (held.some((m) => m.key === key && m.wake_claim)) return undefined;
         const found = held.find((m) => m.key === key && !m.wake_claim &&
@@ -167,7 +120,7 @@ export function fileInbox(): InboxStore {
       });
     },
     ack(key, id) {
-      return withLock(() => {
+      return withStateLock(inboxPath(), () => {
         const held = read();
         const found = held.find((m) => m.key === key && m.wake_claim === id);
         if (!found) return undefined;
@@ -176,11 +129,11 @@ export function fileInbox(): InboxStore {
       });
     },
     claimed(key) {
-      return withLock(() => read().filter((m) => m.key === key && m.wake_claim)
+      return withStateLock(inboxPath(), () => read().filter((m) => m.key === key && m.wake_claim)
         .map((m) => ({ ...strip(m), wake_claim: m.wake_claim })));
     },
     resolve(key, messageId, retry) {
-      return withLock(() => {
+      return withStateLock(inboxPath(), () => {
         const held = read();
         const found = held.find((m) => m.key === key && m.message_id === messageId && m.wake_claim);
         if (!found) return undefined;
@@ -246,4 +199,21 @@ export function memoryInbox(): InboxStore {
       return found.message;
     },
   };
+}
+
+/** Preserve deadlines, receipts and uncertain claims when one connection learns its stable host id. */
+export function moveInbox(from: string, to: string) {
+  if (from === to) return;
+  withStateLock(inboxPath(), () => {
+    const existing = read();
+    const moved = existing.filter((entry) => entry.key === from);
+    if (!moved.length) return;
+    const held = existing.filter((entry) => entry.key !== from);
+    for (const entry of moved) {
+      const duplicate = held.findIndex((other) => other.key === to && other.message_id === entry.message_id);
+      if (duplicate < 0) held.push({ ...entry, key: to });
+      else if (entry.wake_claim && !held[duplicate].wake_claim) held[duplicate] = { ...entry, key: to };
+    }
+    write(held);
+  });
 }

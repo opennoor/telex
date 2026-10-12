@@ -2,7 +2,7 @@
  * Which agents are alive, on disk, so separate telex processes can see each other.
  * Each project's agent runs its own server; only a shared file can tell them apart.
  */
-import { readFileSync, writeFileSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, mkdirSync, renameSync, openSync, closeSync, statSync, unlinkSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -64,8 +64,6 @@ export const registeredSessions = (): Session[] => read();
 const write = (sessions: Session[]) => {
   const path = statePath();
   mkdirSync(dirname(path), { recursive: true });
-  // ponytail: write-rename, no lock. Two agents registering in the same millisecond can lose one
-  // record; it reappears on that agent's next call. Use a lockfile if that ever matters.
   const tmp = `${path}.${process.pid}.tmp`;
   writeFileSync(tmp, `${JSON.stringify({ sessions }, null, 2)}\n`, { mode: 0o600 });
   renameSync(tmp, path);
@@ -97,13 +95,15 @@ export type Registration = Omit<Session, "started_at" | "last_seen" | "repo"> & 
 export function touch(entry: Registration, now = Date.now()): Session[] {
   const stamp = new Date(now).toISOString();
   const repo = entry.repo ?? repoOf(entry.project);
-  const existing = read();
-  // Polling stays with a running server even while the host has no hook events to report.
-  const others = existing.filter((s) => s.session_id !== entry.session_id && running(s.pid));
-  const mine = existing.find((s) => s.session_id === entry.session_id);
-  write([...others, { ...entry, repo, started_at: mine?.started_at ?? stamp, last_seen: stamp }]);
-  // Worktrees of one repository are one project sharing one bot deliberately; that is not a clash.
-  return others.filter((s) => isLive(s, now) && s.bot === entry.bot && s.repo !== repo);
+  return withStateLock(statePath(), () => {
+    const existing = read();
+    // Polling stays with a running server even while the host has no hook events to report.
+    const others = existing.filter((s) => s.session_id !== entry.session_id && running(s.pid));
+    const mine = existing.find((s) => s.session_id === entry.session_id);
+    write([...others, { ...entry, repo, started_at: mine?.started_at ?? stamp, last_seen: stamp }]);
+    // Worktrees of one repository are one project sharing one bot deliberately; that is not a clash.
+    return others.filter((s) => isLive(s, now) && s.bot === entry.bot && s.repo !== repo);
+  });
 }
 
 /**
@@ -115,21 +115,66 @@ export function touch(entry: Registration, now = Date.now()): Session[] {
  * process, which is exactly that case: sharing a repo can mean sharing a bot, but it can never
  * mean sharing the poll.
  *
- * The oldest running process wins until it exits. Host check-ins may be sparse while a long
+ * The central listener takes priority; otherwise the oldest running process wins.
+ * Host check-ins may be sparse while a long
  * question waits, but that must not hand polling to a second process.
  */
 export function ownerOf(bot: string): string | undefined {
   const live = read()
     .filter((s) => s.bot === bot && running(s.pid))
-    .sort((a, b) => a.started_at.localeCompare(b.started_at) || a.session_id.localeCompare(b.session_id));
+    .sort((a, b) => Number(b.agent === "telex-daemon") - Number(a.agent === "telex-daemon") || a.started_at.localeCompare(b.started_at) || a.session_id.localeCompare(b.session_id));
   return live[0]?.session_id;
 }
 
 /** Drop this session's record. Best effort — a crash is covered by the liveness check instead. */
 export function release(sessionId: string) {
   try {
-    write(read().filter((s) => s.session_id !== sessionId));
+    withStateLock(statePath(), () => write(read().filter((s) => s.session_id !== sessionId)));
   } catch {
     // nothing useful to do while exiting
+  }
+}
+
+/**
+ * Exclusive-create is the portable atomic primitive, and a queue needs one: a read-modify-write
+ * racing another can drop a message, and a dropped message is the user's, not ours.
+ *
+ * shortcut: a bounded synchronous spin. state operations are brief; move to async IPC if contention grows.
+ */
+export function withStateLock<T>(path: string, fn: () => T): T {
+  const lock = `${path}.lock`;
+  mkdirSync(dirname(lock), { recursive: true });
+  const deadline = Date.now() + 2000;
+  let held = false;
+  while (Date.now() < deadline) {
+    try {
+      const fd = openSync(lock, "wx");
+      held = true;
+      try { writeFileSync(fd, String(process.pid)); } finally { closeSync(fd); }
+      break;
+    } catch (err) {
+      if (held) {
+        try { unlinkSync(lock); } catch { /* failed acquisition already owns no data */ }
+        throw err;
+      }
+      // A lock left behind by a crash must not wedge every agent on the machine.
+      try {
+        const owner = Number(readFileSync(lock, "utf8"));
+        let alive = false;
+        try { if (owner > 0) { process.kill(owner, 0); alive = true; } }
+        catch (err) { alive = (err as NodeJS.ErrnoException).code === "EPERM"; }
+        if (!alive && (owner > 0 || Date.now() - statSync(lock).mtimeMs > 10_000)) unlinkSync(lock);
+      } catch {
+        // it went away on its own
+      }
+      const until = Date.now() + 20;
+      while (Date.now() < until);
+    }
+  }
+  if (!held) throw new Error("telex: state lock timed out");
+  try {
+    return fn();
+  } finally {
+    try { unlinkSync(lock); } catch { /* already gone */ }
   }
 }

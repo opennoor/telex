@@ -1,6 +1,7 @@
 /** Thin Telegram Bot API client plus an on-demand long-poll loop per bot token. */
 import { memoryInbox, type InboxStore } from "./inbox.ts";
 import { callbackKey, textKey, type AnswerStore } from "./answers.ts";
+import { routeAuthorized, routeLabel, type RouteStore, type RouteRegistration } from "./routes.ts";
 
 export type Update = {
   update_id: number;
@@ -152,13 +153,75 @@ export class BotSession {
   private store: InboxStore = memoryInbox();
   private ttl = new Map<string, number>();
   private listening = false;
+  private routeStore?: RouteStore;
+  private registration?: RouteRegistration;
+  private onIncoming?: (route: RouteRegistration, message: Incoming) => void;
 
   constructor(api: Fetcher, pollTimeout = 30) {
-    this.api = api;
+    this.api = async (method, params, signal) => {
+      const route = this.registration;
+      const prefix = route
+        ? params.parse_mode === "HTML" ? `<b>${escapeHtml(routeLabel(route))}</b>\n\n` : `${routeLabel(route)}\n\n`
+        : "";
+      const outbound = method === "sendMessage" || method === "editMessageText";
+      let body = String(params.text ?? "");
+      if (prefix && body.startsWith(prefix)) body = body.slice(prefix.length);
+      const capacity = MAX_MESSAGE_LEN - prefix.length;
+      const parts: string[] = [];
+      if (outbound) {
+        if (method === "sendMessage") {
+          while (body.length > capacity) {
+            const newline = body.lastIndexOf("\n", capacity);
+            const cut = newline > capacity / 2 ? newline : capacity;
+            parts.push(body.slice(0, cut));
+            body = body.slice(cut).replace(/^\n/, "");
+          }
+        }
+        // Telegram cannot split an edit; reserve room for identity and a settled question's footer.
+        parts.push(body.length > capacity ? `${body.slice(0, capacity - 1)}…` : body);
+      }
+      let result: any;
+      for (const [index, part] of (outbound ? parts : [""]).entries()) {
+        const tagged = outbound ? { ...params, text: prefix + part, ...(method === "sendMessage" && index < parts.length - 1 ? { reply_markup: undefined } : {}) } : params;
+        try { result = await api(method, tagged, signal); }
+        catch (error) {
+          if (!outbound || !(error instanceof TelegramError) || !/parse|entit|tag/i.test(error.description)) throw error;
+          result = await api(method, { ...tagged, text: stripHtml(prefix + part), parse_mode: undefined }, signal);
+        }
+        if (route && method === "sendMessage" && result?.message_id !== undefined) {
+          this.routeStore?.recordMessage(params.chat_id as string | number, result.message_id, route.id);
+        }
+      }
+      return result;
+    };
     this.pollTimeout = pollTimeout;
   }
 
+  get messageCapacity() {
+    return MAX_MESSAGE_LEN - (this.registration ? `<b>${escapeHtml(routeLabel(this.registration))}</b>\n\n`.length : 0) - 100;
+  }
+
+  /** A client owns one durable destination; never share its session object with another route. */
+  setRoute(store: RouteStore, route: RouteRegistration) {
+    store.register(route);
+    this.routeStore = store;
+    this.registration = route;
+  }
+
+  /** The central poller dispatches unsolicited traffic to the route's own queue. */
+  setRouteStore(store: RouteStore, onIncoming: (route: RouteRegistration, message: Incoming) => void) {
+    this.routeStore = store;
+    this.onIncoming = onIncoming;
+  }
+
+  listen() {
+    this.listening = true;
+    this.ensureLoop();
+  }
+
   setAnswerStore(store: AnswerStore) {
+    if (this.answerStore === store) return;
+    if (this.answerStore && this.looping) return;
     this.answerStore = store;
     const offset = store.offset();
     if (offset !== undefined) {
@@ -177,13 +240,13 @@ export class BotSession {
     for (const [id, deadline] of this.callbackDeadlines) {
       const key = callbackKey(id);
       if (!owns && !this.remoteKeys.has(key)) {
-        this.answerStore?.register(key, deadline);
+        this.answerStore?.register(key, deadline, this.registration?.id);
         this.remoteKeys.add(key);
       }
     }
     for (const [key, deadline] of this.textDeadlines) {
       if (!owns && !this.remoteKeys.has(key)) {
-        this.answerStore?.register(key, deadline);
+        this.answerStore?.register(key, deadline, this.registration?.id);
         this.remoteKeys.add(key);
       }
     }
@@ -196,7 +259,7 @@ export class BotSession {
   onCallback(requestId: string, fn: CallbackWaiter, deadline: number): () => void {
     const key = callbackKey(requestId);
     if (!this.pollingOwner) {
-      this.answerStore!.register(key, deadline);
+      this.answerStore!.register(key, deadline, this.registration?.id);
       this.remoteKeys.add(key);
     }
     this.callbackWaiters.set(requestId, fn);
@@ -213,7 +276,7 @@ export class BotSession {
   onText(chatId: number | string, promptId: number, fn: TextWaiter, deadline: number): () => void {
     const key = textKey(chatId, promptId);
     if (!this.pollingOwner) {
-      this.answerStore!.register(key, deadline);
+      this.answerStore!.register(key, deadline, this.registration?.id);
       this.remoteKeys.add(key);
     }
     this.textWaiters.set(key, fn);
@@ -331,34 +394,43 @@ export class BotSession {
   }
 
   private async loop() {
-    await this.skipBacklog();
-    while (this.pollingOwner && (this.listening || !this.idle)) {
-      let updates: Update[];
-      const controller = new AbortController();
-      this.pollAbort = controller;
-      try {
-        updates = await this.api("getUpdates", {
-          offset: this.offset,
-          timeout: this.pollTimeout,
-          allowed_updates: ["message", "callback_query"],
-        }, controller.signal);
-      } catch (err) {
-        if (!this.pollingOwner || !this.listening && this.idle) break;
-        if (isPollingConflict(err)) {
-          process.stderr.write(
-            "telex: getUpdates conflict — another process is polling this bot token. " +
-              "Give telex its own bot, or stop the other poller.\n",
-          );
-        }
-        await new Promise((r) => setTimeout(r, 1000));
-        continue;
-      } finally {
-        if (this.pollAbort === controller) this.pollAbort = undefined;
-      }
-      if (!this.pollingOwner) break;
-      for (const u of updates) this.dispatch(u);
-      this.sweepInbox();
+    while (this.pollingOwner && (this.listening || !this.idle) && this.answerStore && !this.answerStore.claimPolling()) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
     }
+    if (!this.pollingOwner || (!this.listening && this.idle)) return;
+    try {
+      // Another poller may have advanced the durable cursor while we waited for its lease.
+      const saved = this.answerStore?.offset();
+      if (saved !== undefined) { this.offset = Math.max(this.offset, saved); this.backlogSkipped = true; }
+      await this.skipBacklog();
+      while (this.pollingOwner && (this.listening || !this.idle)) {
+        let updates: Update[];
+        const controller = new AbortController();
+        this.pollAbort = controller;
+        try {
+          updates = await this.api("getUpdates", {
+            offset: this.offset,
+            timeout: this.pollTimeout,
+            allowed_updates: ["message", "callback_query"],
+          }, controller.signal);
+        } catch (err) {
+          if (!this.pollingOwner || !this.listening && this.idle) break;
+          if (isPollingConflict(err)) {
+            process.stderr.write(
+              "telex: getUpdates conflict — another process is polling this bot token. " +
+                "Give telex its own bot, or stop the other poller.\n",
+            );
+          }
+          await new Promise((r) => setTimeout(r, 1000));
+          continue;
+        } finally {
+          if (this.pollAbort === controller) this.pollAbort = undefined;
+        }
+        if (!this.pollingOwner) break;
+        for (const u of updates) this.dispatch(u);
+        this.sweepInbox();
+      }
+    } finally { this.answerStore?.releasePolling(); }
   }
 
   /** Exposed for tests: route one update to whoever is waiting for it. */
@@ -370,6 +442,14 @@ export class BotSession {
 
   private route(u: Update) {
     const cq = u.callback_query;
+    if (cq?.data?.startsWith("telex-route:")) {
+      const [, id, choice] = cq.data.split(":");
+      const selected = cq.message && this.routeStore?.selection(id, Number(choice), cq.message.chat.id, cq.from?.id);
+      if (selected) this.onIncoming?.(selected.route, selected.message);
+      void this.api("answerCallbackQuery", { callback_query_id: cq.id, text: selected ? "Delivered to the selected session." : "This selection is stale or belongs to another user." }).catch(() => {});
+      if (selected && cq.message) void this.api("editMessageReplyMarkup", { chat_id: cq.message.chat.id, message_id: cq.message.message_id, reply_markup: { inline_keyboard: [] } }).catch(() => {});
+      return;
+    }
     if (cq?.data?.startsWith("telex:")) {
       const [, requestId, payload] = cq.data.split(":");
       const ctx = {
@@ -379,7 +459,9 @@ export class BotSession {
       };
       const waiter = this.callbackWaiters.get(requestId);
       if (waiter) waiter(payload ?? "", ctx);
-      else this.answerStore?.callback(requestId, payload ?? "", ctx);
+      else if (!this.answerStore?.callback(requestId, payload ?? "", ctx)) {
+        void this.api("answerCallbackQuery", { callback_query_id: cq.id, text: "This question is stale. Ask the agent to send a new prompt." }).catch(() => {});
+      }
       return;
     }
     const msg = u.message;
@@ -394,12 +476,34 @@ export class BotSession {
       // ponytail: bare text may answer an unrelated lone prompt; require reply metadata once clients reliably supply it.
       const waiting = [...this.textWaiters].filter(([candidate]) => candidate.startsWith(`t-${key}-`));
       const remote = this.answerStore?.textKeys(key) ?? [];
-      if (new Set([...waiting.map(([candidate]) => candidate), ...remote]).size === 1) {
+      if ((!this.routeStore || this.routeStore.active(key).length <= 1) && new Set([...waiting.map(([candidate]) => candidate), ...remote]).size === 1) {
         if (waiting.length) return waiting[0][1](msg.text, msg.from?.id);
         if (this.answerStore?.text(key, undefined, msg.text, msg.from?.id)) return;
       }
     }
-    this.queue(key, msg);
+    if (this.routeStore && this.onIncoming) this.routeIncoming(msg);
+    else this.queue(key, msg);
+  }
+
+  private routeIncoming(msg: NonNullable<Update["message"]>) {
+    const store = this.routeStore!;
+    const message: Incoming = { message_id: msg.message_id, from_id: msg.from?.id, text: msg.text!, received_at: Date.now() };
+    if (msg.reply_to_message) {
+      const route = store.message(msg.chat.id, msg.reply_to_message.message_id);
+      if (route && routeAuthorized(route, msg.chat.id, msg.from?.id)) this.onIncoming!(route, message);
+      else if (!route) void this.api("sendMessage", { chat_id: msg.chat.id, text: "That session is stale or unknown. Send a new message to choose an active session.", reply_parameters: { message_id: msg.message_id } }).catch(() => {});
+      return;
+    }
+    const routes = store.active(msg.chat.id).filter((route) => routeAuthorized(route, msg.chat.id, msg.from?.id));
+    if (routes.length === 1) return this.onIncoming!(routes[0], message);
+    if (!routes.length) return;
+    const id = store.select(msg.chat.id, message, routes);
+    void this.api("sendMessage", {
+      chat_id: msg.chat.id,
+      text: "Choose the session that should receive this message:\n\n" + routes.map((route, i) => `${i + 1}. ${routeLabel(route)}`).join("\n"),
+      reply_parameters: { message_id: msg.message_id },
+      reply_markup: { inline_keyboard: routes.map((route, index) => [{ text: `${index + 1}. ${route.provider} · ${route.branch}`.slice(0, 64), callback_data: `telex-route:${id}:${index}` }]) },
+    }).catch(() => {});
   }
 
   /** Nobody asked for this one, so hold it rather than let it answer whatever gets asked next. */
@@ -434,5 +538,7 @@ export const isPollingConflict = (err: unknown) =>
   err instanceof TelegramError && /conflict|terminated by other/i.test(err.description);
 
 const sessions = new Map<string, BotSession>();
-export const sessionFor = (token: string) =>
-  sessions.get(token) ?? (sessions.set(token, new BotSession(apiFor(token))), sessions.get(token)!);
+export const sessionFor = (token: string, routeId = "") => {
+  const key = `${token}:${routeId}`;
+  return sessions.get(key) ?? (sessions.set(key, new BotSession(apiFor(token))), sessions.get(key)!);
+};

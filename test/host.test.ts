@@ -22,9 +22,14 @@ test("Stop continues once when Telegram messages arrived", () => {
   });
 });
 
-test("opaque host sessions map to stable process-scoped MCP UUIDs", () => {
-  const id = hostSessionId("codex", "thr_123", "process-a");
+test("opaque host sessions map to stable worktree-scoped MCP UUIDs", () => {
+  const id = hostSessionId("codex", "thr_123", "/worktree-a");
   assert.match(id, /^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$/);
-  assert.equal(hostSessionId("codex", "thr_123", "process-a"), id);
-  assert.notEqual(hostSessionId("codex", "thr_123", "process-b"), id);
+  assert.equal(hostSessionId("codex", "thr_123", "/worktree-a"), id);
+  assert.notEqual(hostSessionId("codex", "thr_123", "/worktree-b"), id);
+});
+
+test("SessionStart teaches controls and SessionEnd never blocks a host", () => {
+  assert.match(hookOutput("SessionStart", []).hookSpecificOutput!.additionalContext, /options creates choice buttons/);
+  assert.deepEqual(hookOutput("SessionEnd", [message]), {});
 });

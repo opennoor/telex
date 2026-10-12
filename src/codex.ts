@@ -1,24 +1,31 @@
 /** Foreground Telegram bridge for a Telex-owned Codex app-server thread. */
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
-import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createHash, randomUUID } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
-import { loadConfig, pickBot } from "./config.ts";
+import { fileURLToPath } from "node:url";
+import { loadConfig, pickBot, type Bot } from "./config.ts";
 import { fileInbox, scopedInbox } from "./inbox.ts";
-import { statePath, registeredSessions, isLive, release, repoOf, touch } from "./registry.ts";
-import { sessionFor, type Incoming } from "./telegram.ts";
-import { deliveredReceipt, markExpired, receipt, refuse } from "./ask.ts";
+import { statePath, ownerOf, release, repoOf, touch, withStateLock } from "./registry.ts";
+import { sessionFor, type BotSession, type Incoming } from "./telegram.ts";
+import { deliveredReceipt, markExpired, receipt } from "./ask.ts";
 import { processStart } from "./wake.ts";
+import { fileAnswers } from "./answers.ts";
+import { fileRoutes, type RouteRegistration } from "./routes.ts";
+import { announceSession, finishSession, sessionIdentity, sessionProcessAlive } from "./lifecycle.ts";
 
 type RpcMessage = { id?: number; method?: string; params?: any; result?: any; error?: { code?: number; message: string } };
 type Outgoing = { turnId: string; messages: Incoming[]; text?: string };
-type Saved = { threadId: string; project: string; bot: string; pid?: number; start?: string; disabled?: boolean; outbox?: Outgoing[] };
+type Saved = { threadId: string; project: string; bot: string; chatId?: number | string; routeId?: string;
+  route?: RouteRegistration; pid?: number; start?: string; disabled?: boolean; outbox?: Outgoing[] };
 type Pending = { resolve: (value: any) => void; reject: (error: Error) => void; timer: NodeJS.Timeout };
 export class CodexRejection extends Error {}
+const managedRouteId = (project: string, threadId: string) => `codex:${createHash("sha256").update(`${resolve(project)}:${threadId}`).digest("hex")}`;
+const bridgeInstructions = "This is a Telex-managed Codex thread. Telex forwards final answers to Telegram. Use the Telex send_to_user tool with options for clickable choices or expect_text for a typed answer, never both. With neither, it sends a notification. Supply this thread's project_path, agent codex and interval_seconds when the tool requests identity. Await the tool result; a timeout means the user is unavailable. This managed bridge handles incoming Telegram messages; heartbeat and host hooks do not collect them. Command/file approvals remain declined by the bridge.";
 
 export const codexStatePath = (project = process.cwd(), bot = "") =>
-  join(dirname(statePath()), `codex-${createHash("sha256").update(`${repoOf(project)}:${bot}`).digest("hex").slice(0, 16)}.json`);
+  join(dirname(statePath()), `codex-${createHash("sha256").update(`${resolve(project)}:${bot}`).digest("hex").slice(0, 16)}.json`);
 
 export function readCodexState(path: string): Saved | undefined {
   try { return JSON.parse(readFileSync(path, "utf8")) as Saved; }
@@ -34,10 +41,10 @@ export class CodexRpc {
   onClose?: (error: Error) => void;
   private closed = false;
 
-  constructor(command = "codex", args = ["app-server", "-c", 'plugins."telex@telex".enabled=false']) {
+  constructor(command = "codex", args = ["app-server", "-c", 'plugins."telex@telex".enabled=false'], state?: string, botName?: string) {
     this.child = spawn(command, args, {
       stdio: ["pipe", "pipe", "pipe"],
-      env: { ...process.env, TELEX_CODEX_BRIDGE: "1" },
+      env: { ...process.env, TELEX_CODEX_BRIDGE: "1", ...(state ? { TELEX_CODEX_STATE: state } : {}), ...(botName ? { TELEX_BOT: botName } : {}) },
     });
     createInterface({ input: this.child.stdout }).on("line", (line) => {
       let message: RpcMessage;
@@ -111,13 +118,35 @@ function save(path: string, value: Saved) {
   renameSync(tmp, path);
 }
 
+function binding(name?: string) {
+  const selected = pickBot(loadConfig(), name);
+  const botKey = createHash("sha256").update(selected.bot.token).digest("hex");
+  const project = resolve(process.cwd());
+  const path = codexStatePath(project, botKey);
+  const legacy = join(dirname(statePath()), `codex-${createHash("sha256").update(`${repoOf(project)}:${botKey}`).digest("hex").slice(0, 16)}.json`);
+  const source = !existsSync(path) && existsSync(legacy) ? legacy : path;
+  const state = readCodexState(source);
+  if (state && (resolve(state.project) !== project || state.bot !== botKey || state.chatId !== undefined && String(state.chatId) !== String(selected.bot.chatId))) {
+    // A legacy common-repository file may belong to another worktree; never inherit its thread.
+    if (source === path) throw new Error(`Codex bridge binding differs: ${path}`);
+    return { ...selected, botKey, path, project, state: undefined };
+  }
+  return { ...selected, botKey, path, project, state };
+}
+
 export function codexStatus(name?: string) {
-  const { bot } = pickBot(loadConfig(), name);
-  const path = codexStatePath(process.cwd(), createHash("sha256").update(bot.token).digest("hex"));
-  const state = readCodexState(path);
-  let running = false;
-  try { running = !!state?.pid && processStart(state.pid) === state.start; } catch { /* stopped */ }
+  const { path, state } = binding(name);
+  const running = !!state?.pid && sessionProcessAlive({ pid: state.pid, processStart: state.start });
   return { path, state, running };
+}
+
+function savedRoute(state: Saved | undefined, bot: Bot): RouteRegistration {
+  if (!state?.routeId || state.routeId !== managedRouteId(state.project, state.threadId) || !state.route || state.route.id !== state.routeId || state.chatId === undefined ||
+    String(state.chatId) !== String(bot.chatId) || String(state.route.chatId) !== String(bot.chatId) ||
+    resolve(state.route.worktree) !== resolve(state.project)) {
+    throw new Error("legacy Codex delivery has no isolated route; inspect its saved outbox/inbox before resuming or recovering delivery");
+  }
+  return state.route;
 }
 
 export function disableCodex(name?: string) {
@@ -128,22 +157,25 @@ export function disableCodex(name?: string) {
 }
 
 export function pendingCodex(name?: string) {
-  const { bot } = pickBot(loadConfig(), name);
-  const key = createHash("sha256").update(bot.token).digest("hex");
-  const claims = scopedInbox(fileInbox(), key).claimed(String(bot.chatId)).filter((m) => m.wake_claim?.startsWith("codex:"));
-  return { claims, replies: codexStatus(name).state?.outbox ?? [] };
+  const { bot, botKey, state } = binding(name);
+  if (!state) return { claims: [], replies: [] };
+  const route = savedRoute(state, bot);
+  const claims = scopedInbox(fileInbox(), `${botKey}:${route.id}`).claimed(String(bot.chatId)).filter((m) => m.wake_claim?.startsWith("codex:"));
+  return { claims, replies: state.outbox ?? [] };
 }
 
 export async function recoverCodex(id: number, retry: boolean, name?: string) {
-  const { bot } = pickBot(loadConfig(), name);
-  if (codexStatus(name).running) throw new Error("disable the Codex bridge and inspect its thread before recovery");
-  const key = createHash("sha256").update(bot.token).digest("hex");
-  const session = sessionFor(bot.token);
-  const store = scopedInbox(fileInbox(), key);
-  const { path, state } = codexStatus(name);
+  const { bot, botKey, path, state } = binding(name);
+  if (state?.pid && sessionProcessAlive({ pid: state.pid, processStart: state.start })) throw new Error("disable the Codex bridge and inspect its thread before recovery");
+  const route = savedRoute(state, bot);
+  const session = sessionFor(bot.token, route.id);
+  // Recovery identifies the original thread without making this short-lived CLI a destination.
+  session.setRoute(fileRoutes(bot.token), { ...route, expiresAt: Date.now() - 1 });
+  const store = scopedInbox(fileInbox(), `${botKey}:${route.id}`);
+  session.setInboxStore(store);
   const reply = state?.outbox?.find((entry) => entry.messages.some((m) => m.message_id === id));
   if (reply) {
-    if (retry && reply.text) await session.api("sendMessage", { chat_id: bot.chatId, text: reply.text.slice(0, 4000) });
+    if (retry && reply.text) await session.api("sendMessage", { chat_id: bot.chatId, text: reply.text });
     for (const entry of reply.messages) {
       const claimed = store.claimed(String(bot.chatId)).find((m) => m.message_id === entry.message_id);
       if (retry && !reply.text) {
@@ -166,27 +198,47 @@ export async function recoverCodex(id: number, retry: boolean, name?: string) {
 
 export async function runCodex(name?: string) {
   const config = loadConfig();
-  const { bot } = pickBot(config, name);
+  const { bot, name: botName, botKey, path, project, state: old } = binding(name);
   if (!bot.allowFrom?.length) throw new Error("Codex bridge requires a nonempty --allow sender list");
-  const botKey = createHash("sha256").update(bot.token).digest("hex");
-  const path = codexStatePath(process.cwd(), botKey);
-  const old = readCodexState(path);
-  const project = process.cwd();
-  if (old && (old.project !== project || old.bot !== botKey)) throw new Error(`Codex bridge binding differs: ${path}`);
-  if (codexStatus(name).running) throw new Error("Codex bridge is already running here");
-  const other = registeredSessions().find((s) => s.bot === botKey && isLive(s, Date.now()));
-  if (other) throw new Error(`bot already used by ${other.agent} in ${other.project}; use a separate bot for Codex bridge`);
-  const rpc = new CodexRpc();
-  const sessionId = `codex-bridge:${process.pid}:${botKey}`;
+  if (old?.pid && sessionProcessAlive({ pid: old.pid, processStart: old.start })) throw new Error("Codex bridge is already running here");
+  const sessionId = `codex-bridge:${process.pid}:${randomUUID()}:${botKey}`;
   let stopped = false;
   let threadId = "";
   let currentTurnId: string | undefined;
   let timer: NodeJS.Timeout | undefined;
   let sending = false;
-  const session = sessionFor(bot.token);
-  const store = scopedInbox(fileInbox(), botKey);
-  session.setInboxStore(store);
-  session.setInboxTtl(bot.chatId, config.queueExpirySeconds * 1000);
+  let session: BotSession;
+  let store: ReturnType<typeof scopedInbox>;
+  let route: RouteRegistration;
+  let start: string | undefined;
+  try { start = processStart(process.pid); } catch { /* PID-only on non-Linux hosts */ }
+  const lifecycleId = `${sessionId}:${start ?? "process"}`;
+  let lifecycleStarted = false;
+  let cleanup: Promise<void> | undefined;
+  const poller = sessionFor(bot.token);
+  poller.setAnswerStore(fileAnswers(bot.token));
+  const routes = fileRoutes(bot.token);
+  poller.setRouteStore(routes, (destination, message) => {
+    const inbox = scopedInbox(fileInbox(), `${botKey}:${destination.id}`);
+    inbox.push(String(destination.chatId), message, Date.now() + config.queueExpirySeconds * 1000);
+    const client = sessionFor(bot.token, destination.id);
+    client.setRoute(routes, destination);
+    client.setInboxStore(inbox);
+    void receipt(client, destination.chatId, message).then(() => { if (destination.id === route?.id) wake(); }).catch(report);
+  });
+  const claimPolling = () => {
+    poller.setPollingOwner(ownerOf(botKey) === sessionId);
+    poller.listen();
+  };
+  const rpc = new CodexRpc("codex", ["app-server", "-c", 'plugins."telex@telex".enabled=false',
+    "-c", `mcp_servers.telex.command=${JSON.stringify(process.execPath)}`,
+    "-c", `mcp_servers.telex.args=${JSON.stringify([fileURLToPath(new URL("./index.js", import.meta.url))])}`,
+    "-c", "mcp_servers.telex.enabled=true",
+    ...Object.entries({ TELEX_CODEX_BRIDGE: "1", TELEX_CODEX_STATE: path, TELEX_BOT: botName,
+      ...Object.fromEntries(["TELEX_STATE", "TELEX_CONFIG", "TELEX_INBOX", "TELEX_PROJECT_CONFIG"].filter((key) => process.env[key] !== undefined).map((key) => [key, process.env[key]])) })
+      .flatMap(([key, value]) => ["-c", `mcp_servers.telex.env.${key}=${JSON.stringify(value)}`]),
+  ], path, botName);
+  const report = (error: unknown) => { process.stderr.write(`telex: ${(error as Error).message}\n`); };
   const replies = new Map<string, string>();
   const completed = new Set<string>();
   const forwarding = new Set<string>();
@@ -207,7 +259,7 @@ export async function runCodex(name?: string) {
       if (!message) return;
       const id = store.claimed(String(bot.chatId)).find((m) => m.message_id === message.message_id)?.wake_claim;
       if (!id) return;
-      const input = [{ type: "text", text: `Telegram message (${id}):\n${message.text}\n\nReply normally; Telex will forward your final answer to Telegram.` }];
+      const input = [{ type: "text", text: `Telegram message (${id}):\n${message.text}` }];
       let attempted = false;
       try {
         const read = await rpc.request("thread/read", { threadId });
@@ -247,7 +299,7 @@ export async function runCodex(name?: string) {
       if (!text) return;
       entry.text = text;
       setOutbox(outbox().map((item) => item.turnId === turnId ? entry : item));
-      await session.api("sendMessage", { chat_id: bot.chatId, text: text.slice(0, 4000) });
+      await session.api("sendMessage", { chat_id: bot.chatId, text });
       setOutbox(outbox().filter((item) => item.turnId !== turnId));
       replies.delete(turnId);
       wake();
@@ -257,7 +309,7 @@ export async function runCodex(name?: string) {
   rpc.onEvent = (event) => {
     const { method, params } = event;
     if (method === "turn/started" && params?.threadId === threadId) currentTurnId = params.turn?.id;
-    if (method === "item/completed" && params?.item?.type === "agentMessage" && params.item.phase !== "commentary") {
+    if (method === "item/completed" && params?.threadId === threadId && params?.item?.type === "agentMessage" && params.item.phase !== "commentary") {
       replies.set(params.turnId, params.item.text);
     }
     if (method === "turn/completed" && params?.threadId === threadId) {
@@ -268,26 +320,58 @@ export async function runCodex(name?: string) {
       void forward(params.turn.id).catch((err) => process.stderr.write(`telex: reply failed: ${(err as Error).message}\n`));
     }
   };
-  rpc.onClose = (error) => { if (!stopped) { process.stderr.write(`telex: ${error.message}\n`); stop(); } };
+  rpc.onClose = (error) => { if (!stopped) { report(error); void stop().catch(report); } };
 
   function stop() {
-    if (stopped) return;
+    if (cleanup) return cleanup;
     stopped = true;
     if (timer) clearInterval(timer);
-    session.stop();
+    process.removeListener("SIGINT", onSignal);
+    process.removeListener("SIGTERM", onSignal);
+    poller.setPollingOwner(false);
+    poller.stop();
     release(sessionId);
     rpc.stop();
-    const state = readCodexState(path);
-    if (state?.pid === process.pid) save(path, { ...state, pid: undefined, start: undefined });
+    cleanup = (async () => {
+      if (lifecycleStarted) await finishSession(lifecycleId).catch(report);
+      if (route) routes.remove(route.id, { pid: process.pid, processStart: route.processStart });
+      const state = readCodexState(path);
+      if (state?.pid === process.pid) save(path, { ...state, pid: undefined, start: undefined });
+    })();
+    return cleanup;
   }
+  const onSignal = () => { void stop().catch(report); };
 
   try {
+    withStateLock(path, () => {
+      const current = readCodexState(path);
+      if (current?.pid && sessionProcessAlive({ pid: current.pid, processStart: current.start })) throw new Error("Codex bridge is already running here");
+      if (old && !old.routeId && (old.outbox?.length || scopedInbox(fileInbox(), botKey).claimed(String(bot.chatId)).some((message) => message.wake_claim?.startsWith("codex:")))) {
+        throw new Error("legacy Codex deliveries have no isolated route; inspect their saved outbox/inbox before resuming, no delivery was replayed");
+      }
+      save(path, { ...old, threadId: old?.threadId ?? "", project, bot: botKey, chatId: bot.chatId, pid: process.pid, start });
+    });
     await rpc.initialize();
-    const result = await rpc.request(old?.threadId ? "thread/resume" : "thread/start", old?.threadId ? { threadId: old.threadId } : { cwd: project, serviceName: "telex" });
+    const result = await rpc.request(old?.threadId ? "thread/resume" : "thread/start", old?.threadId ? { threadId: old.threadId, developerInstructions: bridgeInstructions } : { cwd: project, serviceName: "telex", developerInstructions: bridgeInstructions });
     threadId = result.thread?.id;
     if (!threadId) throw new Error("Codex did not return a thread id");
     if (old?.threadId && threadId !== old.threadId) throw new Error("Codex resumed a different thread");
-    save(path, { threadId, project, bot: botKey, pid: process.pid, start: processStart(process.pid), outbox: old?.outbox });
+    const routeId = managedRouteId(project, threadId);
+    if (old?.routeId && old.routeId !== routeId) throw new Error("Codex saved route differs from its thread/worktree binding");
+    const previous = routes.get(routeId);
+    if (previous?.pid && previous.pid !== process.pid) throw new Error("Codex thread is already connected in another process");
+    route = { id: routeId, chatId: bot.chatId, botName, provider: "codex", ...sessionIdentity(project), allowFrom: bot.allowFrom, pid: process.pid, processStart: start };
+    session = sessionFor(bot.token, route.id);
+    session.setAnswerStore(fileAnswers(bot.token));
+    session.setPollingOwner(false);
+    session.setRoute(routes, route);
+    store = scopedInbox(fileInbox(), `${botKey}:${route.id}`);
+    session.setInboxStore(store);
+    session.setInboxTtl(bot.chatId, config.queueExpirySeconds * 1000);
+    save(path, { threadId, project, bot: botKey, chatId: bot.chatId, routeId, route,
+      pid: process.pid, start, outbox: old?.outbox });
+    lifecycleStarted = true;
+    await announceSession({ id: lifecycleId, botName, bot, provider: "codex", project, routeId: route.id }).catch(report);
     for (const entry of old?.outbox ?? []) for (const message of entry.messages) {
       const claimed = store.claimed(String(bot.chatId)).find((item) => item.message_id === message.message_id);
       if (claimed?.wake_claim) {
@@ -296,21 +380,17 @@ export async function runCodex(name?: string) {
       }
     }
     touch({ session_id: sessionId, bot: botKey, project, repo: repoOf(project), agent: "codex-bridge", pid: process.pid, interval_seconds: 10 });
-    session.watch(bot.chatId, {
-      allowFrom: bot.allowFrom,
-      accept: () => !stopped,
-      onRefused: (message) => void refuse(session, bot.chatId, message),
-      onQueued: (message) => void receipt(session, bot.chatId, message).then(wake),
-      onExpired: (messages) => markExpired(session, bot.chatId, messages),
-    });
-    console.log(`✓ Codex bridge listening in ${project}\n  Thread: ${threadId}\n  Bot: ${name ?? config.defaultBot}\n  Ctrl+C stops the bridge.`);
+    claimPolling();
+    console.log(`✓ Codex bridge listening in ${project}\n  Thread: ${threadId}\n  Bot: ${botName}\n  Ctrl+C stops the bridge.`);
     timer = setInterval(() => {
-      if (readCodexState(path)?.disabled) { stop(); return; }
+      if (readCodexState(path)?.disabled) { void stop().catch(report); return; }
       touch({ session_id: sessionId, bot: botKey, project, repo: repoOf(project), agent: "codex-bridge", pid: process.pid, interval_seconds: 10 });
+      claimPolling();
+      markExpired(session, bot.chatId, session.sweepInbox(Date.now(), bot.chatId));
       wake();
     }, 1000);
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+    process.once("SIGINT", onSignal);
+    process.once("SIGTERM", onSignal);
     wake();
-  } catch (err) { stop(); throw err; }
+  } catch (err) { await stop(); throw err; }
 }

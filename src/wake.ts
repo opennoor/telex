@@ -8,7 +8,7 @@ import { readConfig, type Bot } from "./config.ts";
 import type { Delivered } from "./ask.ts";
 import type { BotSession, Incoming } from "./telegram.ts";
 
-export type WakeTarget = { socket: string; session: string; pane: string; pid: number; start: string; socketId: string };
+export type WakeTarget = { socket: string; session: string; pane: string; pid: number; start: string; socketId: string; routeId?: string };
 
 function processFields(pid: number) {
   const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -70,7 +70,7 @@ export function withWakeInputLock<T>(fn: () => T): T {
 }
 
 export function wakeTargetFromConfig(): WakeTarget | undefined {
-  let raw: { socket?: string; session?: string; pane?: string; pid?: number; start?: string };
+  let raw: { socket?: string; session?: string; pane?: string; pid?: number; start?: string; routeId?: string };
   try {
     const file = lstatSync(wakeConfigPath());
     if (!file.isFile() || file.uid !== process.getuid?.() || (file.mode & 0o077)) {
@@ -88,7 +88,7 @@ export function wakeTargetFromConfig(): WakeTarget | undefined {
   if (!info.isSocket() || info.uid !== process.getuid?.()) throw new Error("telex: wake socket must belong to this user");
   if (processFields(pid).start !== start || processCommand(pid) !== "codex")
     throw new Error("telex: wake needs Codex as the pane process (start it with exec codex)");
-  const target = { socket, session, pane: pane!, pid, start, socketId: `${info.dev}:${info.ino}` };
+  const target = { socket, session, pane: pane!, pid, start, socketId: `${info.dev}:${info.ino}`, ...(typeof raw.routeId === "string" ? { routeId: raw.routeId } : {}) };
   if (!descendantOf(pid)) throw new Error("telex: MCP server is not a child of the bound Codex pane");
   return target;
 }

@@ -83,7 +83,10 @@ test("owner forwards a reply to the other process without queueing or delivering
   owner.session.watch(7, { onQueued: (message) => queued.push(message.text) });
   const pending = ask(asker.session, 7, { project: "P", message: "Name?", expectText: true, allowFrom: [42], timeoutSeconds: 2 });
   await until(() => asker.calls.some((c) => c.params.reply_markup?.inline_keyboard));
-  await until(() => existsSync(join(dirname(statePath()), "answers")));
+  await until(() => {
+    const root = join(dirname(statePath()), "answers");
+    return existsSync(root) && readdirSync(root).some((name) => readdirSync(join(root, name)).some((key) => key.startsWith("c-")));
+  });
   const data = asker.calls.find((c) => c.params.reply_markup?.inline_keyboard)!.params.reply_markup.inline_keyboard[0][0].callback_data;
   owner.session.dispatch(tap(data, 1));
   await until(() => asker.calls.some((c) => c.params.reply_markup?.force_reply));
@@ -138,7 +141,8 @@ test("promotion keeps an answer already forwarded to the former nonowner", async
   asker.session.dispatch(tap(data, 2));
   await pause(70);
   assert.equal(asker.calls.filter((c) => c.method === "editMessageText").length, 1);
-  assert.equal(asker.calls.filter((c) => c.method === "answerCallbackQuery").length, 1);
+  assert.equal(asker.calls.filter((c) => c.method === "answerCallbackQuery").length, 2);
+  assert.match(asker.calls.filter((c) => c.method === "answerCallbackQuery").at(-1)!.params.text, /stale/);
 });
 
 test("promotion accepts bare text for its one retained question", async (t) => {

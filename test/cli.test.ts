@@ -145,3 +145,95 @@ if (args[0] === "plugin" && args[1] === "marketplace" && args[2] === "list") {
   assert.equal(failure.status, 1);
   assert.match(failure.stderr, /provider install failed/);
 });
+
+test("CLI manages the user service through mocked systemctl", () => {
+  const dir = mkdtempSync(join(tmpdir(), "telex-service-cli-"));
+  const bin = join(dir, "bin");
+  mkdirSync(bin);
+  const log = join(dir, "systemctl.jsonl");
+  const executable = join(bin, "systemctl");
+  writeFileSync(executable, `#!/usr/bin/env node
+const fs = require("node:fs");
+fs.appendFileSync(process.env.TELEX_TEST_LOG, JSON.stringify(process.argv.slice(2)) + "\\n");
+if (process.env.TELEX_TEST_FAIL) { console.error("user manager unavailable"); process.exit(1); }
+console.log("service status");
+`);
+  chmodSync(executable, 0o755);
+  const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+  const env = { ...process.env, PATH: `${bin}:${process.env.PATH}`, XDG_CONFIG_HOME: join(dir, "config"),
+    TELEX_CONFIG: join(dir, "bots.json"), TELEX_STATE: join(dir, "state", "sessions.json"), TELEX_TEST_LOG: log };
+  const run = (action: string) => execFileSync(process.execPath, [cli, "service", action], { cwd: dir, encoding: "utf8", env });
+  assert.match(run("install"), /Installed and started/);
+  const unit = join(dir, "config", "systemd", "user", "telex.service");
+  assert.ok(readFileSync(unit, "utf8").includes(`${cli}" daemon`));
+  run("stop"); run("start");
+  assert.equal(run("status").trim(), "service status");
+  run("uninstall");
+  assert.equal(existsSync(unit), false);
+  assert.deepEqual(readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line)), [
+    ["--user", "daemon-reload"], ["--user", "enable", "--now", "telex.service"],
+    ["--user", "stop", "telex.service"], ["--user", "start", "telex.service"],
+    ["--user", "status", "--no-pager", "telex.service"],
+    ["--user", "disable", "--now", "telex.service"], ["--user", "daemon-reload"],
+  ]);
+  const failure = spawnSync(process.execPath, [cli, "service", "start"], {
+    cwd: dir, encoding: "utf8", env: { ...env, TELEX_TEST_FAIL: "1" },
+  });
+  assert.equal(failure.status, 1);
+  assert.match(failure.stderr, /user manager unavailable/);
+});
+
+test("wake disable retains exact recovery identity and cannot recover another route's claim", async () => {
+  const { createHash } = await import("node:crypto");
+  const { fileInbox, scopedInbox } = await import("../src/inbox.ts");
+  const { fileRoutes } = await import("../src/routes.ts");
+  const dir = mkdtempSync(join(tmpdir(), "telex-wake-recovery-"));
+  const config = join(dir, "config.json");
+  const state = join(dir, "sessions.json");
+  const inbox = join(dir, "inbox.json");
+  const wake = join(dir, "wake.json");
+  const log = join(dir, "api.json");
+  const token = "123:test";
+  const hash = createHash("sha256").update(token).digest("hex");
+  const oldState = process.env.TELEX_STATE;
+  const oldInbox = process.env.TELEX_INBOX;
+  process.env.TELEX_STATE = state;
+  process.env.TELEX_INBOX = inbox;
+  const route = { id: "exact-route", chatId: 7, provider: "codex", botName: "main", repo: dir,
+    branch: "topic", worktree: dir, pid: process.pid };
+  writeFileSync(config, JSON.stringify({ bots: { main: { token, chatId: 7 } } }));
+  writeFileSync(wake, "{}");
+  writeFileSync(`${wake}.recovery.json`, JSON.stringify({ botHash: hash, chatId: 7, route }));
+  fileRoutes(token).register(route);
+  const exact = scopedInbox(fileInbox(), `${hash}:exact-route`);
+  const other = scopedInbox(fileInbox(), `${hash}:other-route`);
+  for (const [store, id] of [[exact, 11], [other, 22]] as const) {
+    store.push("7", { message_id: id, receipt_id: id + 100, text: `message-${id}`, received_at: Date.now() });
+    store.claim("7", `wake-${id}`, () => true);
+  }
+  const preload = join(dir, "telegram.mjs");
+  writeFileSync(preload, `import { writeFileSync } from "node:fs";
+    globalThis.fetch = async (_url, options) => { writeFileSync(${JSON.stringify(log)}, options.body);
+      return { json: async () => ({ ok: true, result: {} }) }; };`);
+  const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+  const env = { ...process.env, TELEX_CONFIG: config, TELEX_PROJECT_CONFIG: join(dir, ".telex.json"),
+    TELEX_STATE: state, TELEX_INBOX: inbox, TELEX_WAKE_CONFIG: wake };
+  const run = (...args: string[]) => execFileSync(process.execPath, ["--import", preload, cli, "wake", ...args], { cwd: dir, encoding: "utf8", env });
+  try {
+    run("disable");
+    assert.equal(existsSync(wake), false);
+    assert.equal(existsSync(`${wake}.recovery.json`), true);
+    assert.match(run("pending"), /11\tmessage-11/);
+    assert.doesNotMatch(run("pending"), /message-22/);
+    assert.throws(() => run("recover", "22", "--delivered"), /no pending wake claim/);
+    run("recover", "11", "--delivered");
+    assert.deepEqual(exact.claimed("7"), []);
+    assert.equal(other.claimed("7")[0].message_id, 22);
+    assert.match(JSON.parse(readFileSync(log, "utf8")).text, /main · codex/);
+    assert.match(JSON.parse(readFileSync(log, "utf8")).text, /Delivered|Submitted/);
+    assert.equal(fileRoutes(token).get(route.id)?.pid, process.pid, "recovery never overwrites a live route");
+  } finally {
+    if (oldState === undefined) delete process.env.TELEX_STATE; else process.env.TELEX_STATE = oldState;
+    if (oldInbox === undefined) delete process.env.TELEX_INBOX; else process.env.TELEX_INBOX = oldInbox;
+  }
+});
