@@ -230,7 +230,8 @@ test("SessionStart before MCP readiness is spooled for its exact live host and S
     for (let n = 0; n < 100 && !readFileSync(log, "utf8").includes("session started"); n++) await new Promise((resolve) => setTimeout(resolve, 20));
     const calls = () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
     assert.equal(calls().filter((call) => call.text?.includes("session started")).length, 1);
-    assert.match(calls()[0].text, /main · codex/);
+    assert.match(calls()[0].text, /Telex session started\nBot: main\nAgent: codex/);
+    assert.match(calls()[0].text, /\n\n↳ worktree /);
     await invokeCodexHook({ ...input, hook_event_name: "Stop" }, state);
     assert.equal(calls().filter((call) => call.text?.includes("session ended")).length, 0);
     await invokeCodexHook({ ...input, hook_event_name: "SessionEnd" }, state);

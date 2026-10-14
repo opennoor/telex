@@ -1,13 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { mkdtempSync, readFileSync, writeFileSync, existsSync, readdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, type ChildProcess } from "node:child_process";
 import { once } from "node:events";
+import { createConnection } from "node:net";
+import { createHash } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { processStart } from "../src/wake.js";
 
 const waitFor = async (predicate: () => boolean, label: string) => {
   for (let i = 0; i < 200; i++) {
@@ -17,6 +20,26 @@ const waitFor = async (predicate: () => boolean, label: string) => {
   assert.fail(label);
 };
 const value = (result: any) => JSON.parse(result.content[0].text);
+const rootHook = (event: string, project_path: string, host_session_id = "same-host") => ({ event, host_session_id, project_path,
+  agent: "codex", root_session: true, host_pid: process.pid, host_process_start: processStart(process.pid) });
+function spoolRoot(dir: string, hostSessionId = "same-host") {
+  const hostStart = processStart(process.pid);
+  const path = join(dir, `hook-start-${createHash("sha256").update(`codex:${process.pid}`).digest("hex")}.json`);
+  writeFileSync(path, JSON.stringify({ ...rootHook("SessionStart", dir, hostSessionId), hostPid: process.pid, hostStart, at: Date.now() }));
+}
+function sendRootHook(dir: string, input: object) {
+  const socket = join(dir, readdirSync(dir).find((name) => /^hook-\d+-[0-9a-f-]+\.sock$/.test(name))!);
+  return new Promise<any>((resolve, reject) => {
+    const connection = createConnection(socket);
+    let response = "";
+    const event = (input as { event?: string }).event;
+    const timer = setTimeout(() => { connection.destroy(); reject(new Error("host hook socket request timed out")); }, event === "SessionEnd" ? 20_000 : 3000);
+    connection.on("connect", () => connection.end(`${JSON.stringify(input)}\n`));
+    connection.on("data", (chunk) => { response += chunk; if (response.includes("\n")) { clearTimeout(timer); resolve(JSON.parse(response.slice(0, response.indexOf("\n")))); connection.destroy(); } });
+    connection.on("error", reject);
+    connection.on("close", () => { if (!response.includes("\n")) reject(new Error("host hook socket closed without a response")); });
+  });
+}
 
 test("multiple MCP sessions share a durable listener without sharing replies, buttons or queues", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "telex-integration-"));
@@ -91,9 +114,8 @@ test("multiple MCP sessions share a durable listener without sharing replies, bu
   const [sentA, sentB] = await Promise.all([notify(a, "agent-alpha"), notify(b, "agent-beta")]);
   const calls = (): any[] => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
   const outboundA = calls().find((call) => call.result.message_id === sentA.message_id);
-  assert.match(outboundA.input.text, /main · agent-alpha/);
+  assert.match(outboundA.input.text, /↳ worktree telex-integration-/);
   assert.match(outboundA.input.text, /Full payload for agent-alpha/);
-  assert.ok(outboundA.input.text.includes(dir));
 
   const questions = [a, b].map((client, i) => client.callTool({ name: "send_to_user", arguments: {
     ...args(i ? "agent-beta" : "agent-alpha"), project: "choice", message: i ? "Choose beta" : "Choose alpha",
@@ -143,6 +165,7 @@ test("host reconnect consolidates the announced connection and preserves earlier
   const preload = join(dir, "telegram.mjs");
   writeFileSync(config, JSON.stringify({ bots: { main: { token: "123:test", chatId: 7, allowFrom: [42] } } }));
   writeFileSync(join(dir, ".telex.json"), JSON.stringify({ bot: "main" }));
+  spoolRoot(dir);
   writeFileSync(updates, "[]"); writeFileSync(log, "");
   writeFileSync(preload, `import {readFileSync,appendFileSync} from 'node:fs'; let n=0;
     globalThis.fetch=async(url,opts)=>{const method=String(url).split('/').at(-1),input=JSON.parse(opts.body);
@@ -160,19 +183,25 @@ test("host reconnect consolidates the announced connection and preserves earlier
     return client;
   };
   t.after(async () => { for (const client of clients) await client.close(); });
-  const callHook = (client: Client, event = "SessionStart") => client.callTool({ name: "host_hook", arguments: {
-    event, host_session_id: "same-host", project_path: dir, agent: "codex",
+  const callHook = (client: Client, event = "SessionStart", hostSessionId = "same-host") => client.callTool({ name: "host_hook", arguments: {
+    event, host_session_id: hostSessionId, project_path: dir, agent: "codex",
   } });
   const calls = (): any[] => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  const hash = createHash("sha256").update("123:test").digest("hex");
   const first = await connect();
   await waitFor(() => calls().some((call) => call.input.text?.includes("session started")), "startup announced before a model tool call");
   const firstHook = value(await callHook(first));
   assert.match(firstHook.hookSpecificOutput.additionalContext, /choice buttons/);
   await first.close();
+  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 0,
+    "an MCP reconnect does not end the still-live host root");
   const second = await connect();
-  await waitFor(() => calls().filter((call) => call.input.text?.includes("session started")).length === 2, "reconnected MCP announced");
+  await waitFor(() => calls().filter((call) => call.input.text?.includes("session started")).length === 1, "same root session was not announced twice after MCP reconnect");
   const provisionalResult = value(await second.callTool({ name: "heartbeat", arguments: { project_path: dir, agent: "codex", interval_seconds: 60 } }));
   const startupMessage = calls().filter((call) => call.input.text?.includes("session started")).at(-1).result.message_id;
+  const startRoute = JSON.parse(readFileSync(join(dir, "routes", `${hash}.json`), "utf8"));
+  assert.equal(startRoute.messages[`7:${startupMessage}`], `${provisionalResult.session_id}:7`,
+    "a lifecycle start reply maps to the active route even though host and MCP PIDs differ");
   writeFileSync(updates, JSON.stringify([{ update_id: 1, message: { message_id: 501, chat: { id: 7 }, from: { id: 42 },
     text: "before host identification", reply_to_message: { message_id: startupMessage } } }]));
   await waitFor(() => { try { return JSON.parse(readFileSync(inbox, "utf8")).held.some((m: any) => m.message_id === 501); } catch { return false; } }, "startup reply queued");
@@ -181,7 +210,6 @@ test("host reconnect consolidates the announced connection and preserves earlier
   held.held.push({ key: originalKey, message_id: 502, text: "claimed before identity", received_at: Date.now(), expires_at: Date.now() + 60000, wake_claim: "channel:preserved", receipt_id: 333 });
   writeFileSync(inbox, JSON.stringify(held));
   assert.match(value(await callHook(second)).hookSpecificOutput.additionalContext, /before host identification/);
-  const hash = (await import("node:crypto")).createHash("sha256").update("123:test").digest("hex");
   const routeState = JSON.parse(readFileSync(join(dir, "routes", `${hash}.json`), "utf8"));
   const routes = Object.values(routeState.routes) as any[];
   assert.equal(routes.length, 1, "provisional route is consolidated into the same host destination");
@@ -197,9 +225,52 @@ test("host reconnect consolidates the announced connection and preserves earlier
   assert.equal(result.messages[0].text, "after host identification");
   assert.equal(`${result.session_id}:7`, routes[0].id, "echoing a provisional id returns the canonical session");
   await callHook(second, "Stop");
-  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 1, "Stop does not end the second lifetime");
+  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 0, "Stop does not end the root lifetime");
+  await callHook(second, "SessionStart", "untrusted-child-host");
   await callHook(second, "SessionEnd");
-  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 2);
+  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 0, "a model-call cannot spoof root SessionEnd");
+  await sendRootHook(dir, rootHook("SessionEnd", dir));
+  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 1);
+});
+
+test("simultaneous attested root sessions keep independent lifecycle and reply routes", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "telex-multi-root-"));
+  const config = join(dir, "config.json"), log = join(dir, "api.jsonl"), preload = join(dir, "telegram.mjs");
+  writeFileSync(config, JSON.stringify({ bots: { main: { token: "123:test", chatId: 7 } } }));
+  writeFileSync(join(dir, ".telex.json"), JSON.stringify({ bot: "main" }));
+  writeFileSync(log, "");
+  writeFileSync(preload, `import {appendFileSync} from 'node:fs';let n=0;
+    globalThis.fetch=async(url,options)=>{const method=String(url).split('/').at(-1),input=JSON.parse(options.body);
+      if(method==='getUpdates'){await new Promise(resolve=>setTimeout(resolve,15));return {json:async()=>({ok:true,result:[]})};}
+      appendFileSync(${JSON.stringify(log)},JSON.stringify({method,input})+'\\n');
+      return {json:async()=>({ok:true,result:{message_id:++n}})};};`);
+  const cli = fileURLToPath(new URL("../../dist/cli.js", import.meta.url));
+  const env = { ...process.env, TELEX_CONFIG: config, TELEX_PROJECT_CONFIG: join(dir, ".telex.json"), TELEX_STATE: join(dir, "sessions.json") };
+  const client = new Client({ name: "multi-root", version: "1" });
+  t.after(async () => client.close());
+  await client.connect(new StdioClientTransport({ command: process.execPath, args: ["--import", preload, cli, "serve"], cwd: dir, env }));
+  await waitFor(() => readdirSync(dir).some((name) => /^hook-\d+-[0-9a-f-]+\.sock$/.test(name)), "private hook socket starts");
+  const calls = () => readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(calls().filter((call) => call.input.text?.includes("session started")).length, 0, "generic MCP starts silently");
+  const firstStart = await sendRootHook(dir, rootHook("SessionStart", dir, "root-one"));
+  assert.equal(firstStart.accepted, true, "first root hook reaches the local server");
+  await waitFor(() => calls().filter((call) => call.input.text?.includes("session started")).length === 1, "first root starts once");
+  await sendRootHook(dir, rootHook("SessionStart", dir, "root-two"));
+  await waitFor(() => calls().filter((call) => call.input.text?.includes("session started")).length === 2, "second root starts once");
+  const hash = createHash("sha256").update("123:test").digest("hex");
+  const routeState = () => JSON.parse(readFileSync(join(dir, "routes", `${hash}.json`), "utf8"));
+  const starts = calls().filter((call) => call.input.text?.includes("session started"));
+  const rootOne = routeState().messages["7:1"];
+  const rootTwo = routeState().messages["7:2"];
+  assert.notEqual(rootOne, rootTwo, "each root start message maps to its own route");
+  await sendRootHook(dir, rootHook("SessionEnd", dir, "root-one"));
+  await waitFor(() => calls().filter((call) => call.input.text?.includes("session ended")).length === 1, "first root ends once");
+  assert.deepEqual(Object.keys(routeState().routes), [rootTwo], "ending one root leaves the other root route active");
+  await sendRootHook(dir, rootHook("SessionEnd", dir, "root-one"));
+  assert.equal(calls().filter((call) => call.input.text?.includes("session ended")).length, 1, "duplicate old end is ignored");
+  await sendRootHook(dir, rootHook("SessionEnd", dir, "root-two"));
+  await waitFor(() => calls().filter((call) => call.input.text?.includes("session ended")).length === 2, "second root ends once");
 });
 
 test("delayed old SessionEnd cleanup cannot remove a newly reattached owner", async (t) => {
@@ -211,6 +282,7 @@ test("delayed old SessionEnd cleanup cannot remove a newly reattached owner", as
   const preload = join(dir, "telegram.mjs");
   writeFileSync(config, JSON.stringify({ bots: { main: { token: "123:test", chatId: 7 } } }));
   writeFileSync(join(dir, ".telex.json"), JSON.stringify({ bot: "main" }));
+  spoolRoot(dir);
   writeFileSync(preload, `import {existsSync,writeFileSync} from 'node:fs'; let n=0;
     globalThis.fetch=async(url,options)=>{const method=String(url).split('/').at(-1),input=JSON.parse(options.body);
       if(method==='getUpdates') await new Promise(r=>setTimeout(r,10));
@@ -229,16 +301,22 @@ test("delayed old SessionEnd cleanup cannot remove a newly reattached owner", as
   };
   t.after(async () => { writeFileSync(release, "release"); for (const client of clients) await client.close(); });
   const first = await connect();
-  const hook = { host_session_id: "same-host", project_path: dir, agent: "codex" };
-  await first.callTool({ name: "host_hook", arguments: { ...hook, event: "SessionStart" } });
-  const pendingEnd = first.callTool({ name: "host_hook", arguments: { ...hook, event: "SessionEnd" } });
+  const pendingEnd = sendRootHook(dir, rootHook("SessionEnd", dir));
+  void pendingEnd.catch(() => {});
   await waitFor(() => existsSync(ending), "old lifetime end is paused in Telegram I/O");
-  await connect();
-  const hash = (await import("node:crypto")).createHash("sha256").update("123:test").digest("hex");
+  const second = await connect();
+  await second.callTool({ name: "heartbeat", arguments: { project_path: dir, agent: "codex", interval_seconds: 60 } });
+  const hash = createHash("sha256").update("123:test").digest("hex");
   const routes = () => Object.values(JSON.parse(readFileSync(join(dir, "routes", `${hash}.json`), "utf8")).routes) as any[];
   await waitFor(() => routes().length === 1, "new connection owns the stable destination");
   const owner = routes()[0].pid;
   writeFileSync(release, "release");
-  await pendingEnd;
+  await waitFor(() => {
+    try {
+      const file = readdirSync(join(dir, "lifecycle")).find((name) => name.endsWith(".json"));
+      return Boolean(file && JSON.parse(readFileSync(join(dir, "lifecycle", file), "utf8")).end === "sent");
+    } catch { return false; }
+  }, "old root end notification completes");
+  void pendingEnd;
   assert.equal(routes()[0]?.pid, owner, "old cleanup cannot delete the new process's route");
 });

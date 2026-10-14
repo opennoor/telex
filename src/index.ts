@@ -9,10 +9,10 @@ import { touch, release, ownerOf, statePath } from "./registry.ts";
 import { fileInbox, scopedInbox, moveInbox } from "./inbox.ts";
 import { fileAnswers } from "./answers.ts";
 import { fileRoutes, type RouteRegistration } from "./routes.ts";
-import { announceSession, finishSession, identifySession, configuredProject, sessionIdentity } from "./lifecycle.ts";
+import { announceSession, finishSession, configuredProject, sessionIdentity } from "./lifecycle.ts";
 import { createHash, randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
-import { hookOutput, hostSessionId, boundHostSessionId, controls, processAncestors } from "./host.ts";
+import { hookOutput, hostSessionId, boundHostSessionId, controls, processAncestors, rootLifecycleHook } from "./host.ts";
 import { Wake, wakeTargetFromConfig, processStart, type WakeTarget } from "./wake.ts";
 import { createServer } from "node:net";
 import { mkdirSync, chmodSync, unlinkSync, readFileSync, readdirSync } from "node:fs";
@@ -40,10 +40,11 @@ const monitoredBots = new Map<string, Bot>();
 const pollers = new Map<string, BotSession>();
 let wake: Wake | undefined;
 let wakeTarget: WakeTarget | undefined;
+const rootOwners = new Map<string, { id: string; pid?: number; processStart?: string }>();
 let lastIdleStop: { hostId: string; at: number } | undefined;
 const report = (error: unknown) => { process.stderr.write(`telex: ${(error as Error).message}\n`); };
 
-type Caller = { project_path: string; agent: string; interval_seconds: number; session_id?: string };
+type Caller = { project_path: string; agent: string; interval_seconds: number; session_id?: string; lifecycleRoot?: boolean };
 
 function bind(bot: Bot, caller: Caller, botName: string): BotSession {
   const routes = fileRoutes(bot.token);
@@ -84,10 +85,18 @@ function bind(bot: Bot, caller: Caller, botName: string): BotSession {
 
 function track(bot: Bot, caller: Caller, botName: string) {
   if (codexBridge) return;
+  const owner = caller.session_id ? rootOwners.get(caller.session_id) : undefined;
+  if (!owner?.pid || !caller.lifecycleRoot || canonicalSession(bot, owner.id) !== caller.session_id) return;
   const entry = clients.get(clientKey(bot, caller.session_id))!;
-  if (entry.lifecycle) { identifySession(entry.lifecycleId, caller.agent, caller.project_path, entry.route.id); return; }
-  entry.lifecycle = announceSession({ id: entry.lifecycleId, botName, bot, provider: caller.agent,
-    project: caller.project_path, routeId: entry.route.id }).catch(report);
+  entry.lifecycleId = `${pollKey(bot)}:${owner.id}`;
+  const lifecycle = { id: entry.lifecycleId, botName, bot, provider: caller.agent,
+    project: caller.project_path, routeId: entry.route.id, root: true, pid: owner.pid, processStart: owner.processStart,
+    routePid: entry.route.pid, routeProcessStart: entry.route.processStart };
+  if (entry.lifecycle) {
+    entry.lifecycle = entry.lifecycle.then(() => announceSession(lifecycle)).catch(report);
+    return;
+  }
+  entry.lifecycle = announceSession(lifecycle).catch(report);
 }
 
 /** Local ownership is a fallback when the persistent listener is unavailable. */
@@ -332,21 +341,37 @@ type HostHook = {
   agent: string;
   stop_hook_active?: boolean;
   prompt?: string;
+  agent_id?: string;
+  root_session?: boolean;
+  host_pid?: number;
+  host_process_start?: string;
 };
 
-async function handleHostHook({ event, host_session_id, project_path, agent, stop_hook_active, prompt }: HostHook) {
+async function handleHostHook({ event, host_session_id, project_path, agent, stop_hook_active, prompt, agent_id, root_session, host_pid, host_process_start }: HostHook, attested = false) {
   const { bot, name } = pickBot(config);
-  const id = boundHostSessionId(agent, host_session_id, project_path, !hookHostId ? activeSession : undefined);
+  const id = boundHostSessionId(agent, host_session_id, project_path, hookHostIds.size === 0 ? activeSession : undefined);
+  const rootAttested = attested && attestsRoot({ event, agent, agent_id, root_session, host_pid, host_process_start });
   if (event === "SessionEnd") {
+    if (!rootAttested) return {};
+    const owner = rootOwners.get(id);
+    if (!owner || owner.pid !== host_pid || owner.processStart !== host_process_start) return {};
     for (const entry of clients.values()) if (entry.route.id === routeId(entry.bot, id)) {
       await entry.lifecycle;
       await finishSession(entry.lifecycleId).catch(report);
       fileRoutes(entry.bot.token).remove(entry.route.id, { pid: process.pid, processStart: entry.route.processStart });
       clients.delete(clientKey(entry.bot, id));
     }
+    rootOwners.delete(id);
+    hookHostIds.delete(host_session_id);
     return {};
   }
-  const provisional = !hookHostId && activeSession !== id ? clients.get(clientKey(bot)) : undefined;
+  const firstRoot = rootOwners.size === 0;
+  if (rootAttested && event === "SessionStart") {
+    rootOwners.set(id, { id, pid: host_pid, processStart: host_process_start });
+    hookHostIds.add(host_session_id);
+  }
+  const previousActiveSession = activeSession;
+  const provisional = rootAttested && firstRoot && activeSession !== id ? clients.get(clientKey(bot)) : undefined;
   if (provisional) {
     const migrated = { ...provisional.route, id: routeId(bot, id), provider: agent, ...sessionIdentity(project_path) };
     fileRoutes(bot.token).rebind(provisional.route.id, migrated);
@@ -357,8 +382,8 @@ async function handleHostHook({ event, host_session_id, project_path, agent, sto
     destination.lifecycleId = provisional.lifecycleId;
     clients.delete(clientKey(bot));
   }
-  hookHostId = host_session_id;
-  const { session } = checkIn(bot, { project_path, agent, interval_seconds: 60, session_id: id }, name);
+  const { session } = checkIn(bot, { project_path, agent, interval_seconds: 60, session_id: id, lifecycleRoot: rootAttested }, name);
+  if (!rootAttested) activeSession = previousActiveSession;
   const messages = channelMode || codexBridge || event === "Stop" && stop_hook_active ? [] : heartbeat(session, bot.chatId);
   lastIdleStop = event === "Stop" && agent === "codex" && !stop_hook_active && messages.length === 0
     ? { hostId: host_session_id, at: Date.now() } : undefined;
@@ -367,15 +392,21 @@ async function handleHostHook({ event, host_session_id, project_path, agent, sto
   return hookOutput(event, messages);
 }
 
+function attestsRoot(input: Pick<HostHook, "event" | "agent" | "agent_id" | "root_session" | "host_pid" | "host_process_start">) {
+  if (input.root_session !== true || !input.host_pid || !input.host_process_start || !rootLifecycleHook(input.agent, input.event, input.agent_id)) return false;
+  try { return processAncestors(process.pid).includes(input.host_pid) && processStart(input.host_pid) === input.host_process_start; }
+  catch { return false; }
+}
+
 const startup = pickBot(config);
 if (channelMode && !startup.bot.allowFrom?.length) throw new Error("telex: channel mode requires a nonempty allowFrom sender list");
-let hookHostId: string | undefined;
+const hookHostIds = new Set<string>();
 const hookSocket = join(dirname(statePath()), `hook-${process.pid}-${randomUUID()}.sock`);
 const hookServer = createServer((connection) => {
   connection.on("error", (error) => {
     if ((error as NodeJS.ErrnoException).code !== "EPIPE") report(error);
   });
-  connection.setTimeout(1500, () => connection.destroy());
+  connection.setTimeout(15_000, () => connection.destroy());
   let input = "";
   connection.on("data", async (chunk: Buffer) => {
     input += chunk.toString("utf8");
@@ -386,13 +417,15 @@ const hookServer = createServer((connection) => {
     let response: object = { accepted: false };
     try {
       const value = JSON.parse(input.slice(0, line)) as HostHook & { probe?: boolean; ancestors?: number[] };
+      connection.setTimeout(value.event === "SessionEnd" ? 15_000 : 1500, () => connection.destroy());
+      const rootStart = value.event === "SessionStart" && attestsRoot(value);
       const eligible = ["SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse", "Stop"].includes(value.event) &&
         typeof value.host_session_id === "string" && value.host_session_id.length > 0 &&
         typeof value.project_path === "string" && resolve(value.project_path) === resolve(process.cwd()) &&
-        (!hookHostId || hookHostId === value.host_session_id);
+        (hookHostIds.size === 0 || hookHostIds.has(value.host_session_id) || rootStart);
       if (eligible) {
-        if (value.probe) response = { eligible: true, bound: hookHostId === value.host_session_id, ancestors: processAncestors(process.pid) };
-        else response = { accepted: true, output: await handleHostHook(value) };
+        if (value.probe) response = { eligible: true, bound: hookHostIds.has(value.host_session_id), ancestors: processAncestors(process.pid) };
+        else response = { accepted: true, output: await handleHostHook(value, true) };
       }
     } catch (error) { report(error); }
     if (!connection.destroyed) connection.end(`${JSON.stringify(response)}\n`);
@@ -416,7 +449,6 @@ async function close() {
   for (const entry of clients.values()) {
     if (codexBridge) continue;
     await entry.lifecycle;
-    if (entry.lifecycle) await finishSession(entry.lifecycleId).catch(report);
     fileRoutes(entry.bot.token).remove(entry.route.id, { pid: process.pid, processStart: entry.route.processStart });
   }
   for (const bot of monitoredBots.values()) release(registrationId(bot));
@@ -432,23 +464,31 @@ process.on("exit", () => {
 });
 await server.connect(transport);
 channelReady = true;
-let pendingStart: HostHook | undefined;
+let pendingStart: (HostHook & { hostPid?: number; hostStart?: string }) | undefined;
 try {
   const ancestors = processAncestors(process.pid);
   const pending = readdirSync(dirname(statePath())).filter((file) => /^hook-start-[a-f0-9]+\.json$/.test(file))
     .map((file) => JSON.parse(readFileSync(join(dirname(statePath()), file), "utf8")))
     .filter((event) => event.event === "SessionStart" && resolve(event.project_path) === resolve(process.cwd()) &&
-      ancestors.includes(event.hostPid) && processStart(event.hostPid) === event.hostStart)
+      event.root_session === true && ancestors.includes(event.hostPid) && processStart(event.hostPid) === event.hostStart)
     .sort((a, b) => b.at - a.at);
   pendingStart = pending[0];
 } catch { /* no exact host startup was spooled */ }
 if (pendingStart) {
-  hookHostId = pendingStart.host_session_id;
+  hookHostIds.add(pendingStart.host_session_id);
   activeSession = boundHostSessionId(pendingStart.agent, pendingStart.host_session_id, process.cwd());
+  rootOwners.set(activeSession, { id: activeSession, pid: pendingStart.host_pid ?? pendingStart.hostPid,
+    processStart: pendingStart.host_process_start ?? pendingStart.hostStart });
 }
 const startupCaller = { project_path: process.cwd(), agent: pendingStart?.agent ?? (channelMode ? "claude-code" : process.env.TELEX_AGENT ?? "mcp"), interval_seconds: 60 };
 if (!codexBridge) activeSession = canonicalSession(startup.bot, activeSession);
+if (pendingStart) {
+  const owner = [...rootOwners.values()][0];
+  if (owner) { rootOwners.clear(); rootOwners.set(activeSession, { ...owner, id: activeSession }); }
+}
 if (!codexBridge) bind(startup.bot, startupCaller, startup.name);
-if (!codexBridge && (configuredProject(process.cwd()) || channelMode)) track(startup.bot, startupCaller, startup.name);
+if (!codexBridge && rootOwners.get(activeSession)?.pid && (configuredProject(process.cwd()) || channelMode)) {
+  track(startup.bot, { ...startupCaller, session_id: activeSession, lifecycleRoot: true }, startup.name);
+}
 monitor(startup.bot);
 void pushChannel();

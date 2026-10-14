@@ -212,7 +212,7 @@ export async function runCodex(name?: string) {
   let route: RouteRegistration;
   let start: string | undefined;
   try { start = processStart(process.pid); } catch { /* PID-only on non-Linux hosts */ }
-  const lifecycleId = `${sessionId}:${start ?? "process"}`;
+  let lifecycleId = "";
   let lifecycleStarted = false;
   let cleanup: Promise<void> | undefined;
   const poller = sessionFor(bot.token);
@@ -357,6 +357,7 @@ export async function runCodex(name?: string) {
     if (!threadId) throw new Error("Codex did not return a thread id");
     if (old?.threadId && threadId !== old.threadId) throw new Error("Codex resumed a different thread");
     const routeId = managedRouteId(project, threadId);
+    lifecycleId = `${botKey}:${routeId}`;
     if (old?.routeId && old.routeId !== routeId) throw new Error("Codex saved route differs from its thread/worktree binding");
     const previous = routes.get(routeId);
     if (previous?.pid && previous.pid !== process.pid) throw new Error("Codex thread is already connected in another process");
@@ -371,7 +372,8 @@ export async function runCodex(name?: string) {
     save(path, { threadId, project, bot: botKey, chatId: bot.chatId, routeId, route,
       pid: process.pid, start, outbox: old?.outbox });
     lifecycleStarted = true;
-    await announceSession({ id: lifecycleId, botName, bot, provider: "codex", project, routeId: route.id }).catch(report);
+    await announceSession({ id: lifecycleId, botName, bot, provider: "codex", project, routeId: route.id, root: true,
+      pid: process.pid, processStart: start, routePid: process.pid, routeProcessStart: start }).catch(report);
     for (const entry of old?.outbox ?? []) for (const message of entry.messages) {
       const claimed = store.claimed(String(bot.chatId)).find((item) => item.message_id === message.message_id);
       if (claimed?.wake_claim) {

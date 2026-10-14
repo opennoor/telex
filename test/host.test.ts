@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { hookOutput, hostSessionId } from "../src/host.ts";
+import { hookOutput, hostSessionId, rootLifecycleHook } from "../src/host.ts";
 
 const message = { text: "stop the deploy", received_at: "2026-09-25T10:00:00.000Z", waited_seconds: 2 };
 
@@ -32,4 +32,14 @@ test("opaque host sessions map to stable worktree-scoped MCP UUIDs", () => {
 test("SessionStart teaches controls and SessionEnd never blocks a host", () => {
   assert.match(hookOutput("SessionStart", []).hookSpecificOutput!.additionalContext, /options creates choice buttons/);
   assert.deepEqual(hookOutput("SessionEnd", [message]), {});
+});
+
+test("root lifecycle eligibility uses session-event contracts and Claude agent identity", () => {
+  assert.equal(rootLifecycleHook("codex", "SessionStart"), true);
+  assert.equal(rootLifecycleHook("codex", "SessionEnd"), true);
+  assert.equal(rootLifecycleHook("codex", "SubagentStop"), false);
+  assert.equal(rootLifecycleHook("claude-code", "SessionStart"), true);
+  assert.equal(rootLifecycleHook("claude-code", "SessionStart", "agent-1"), false);
+  assert.equal(rootLifecycleHook("claude-code", "SessionEnd", "agent-1"), false);
+  assert.equal(rootLifecycleHook("claude-code", "PostToolUse"), false);
 });

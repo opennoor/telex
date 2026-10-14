@@ -12,7 +12,7 @@ import { fileRoutes, fileRoutesByHash } from "./routes.ts";
 export type SessionIdentity = { repo: string; branch: string; worktree: string };
 export type LifecycleSession = SessionIdentity & {
   id: string; botName: string; botHash: string; chatId: number | string; provider: string; project: string; routeId?: string;
-  pid: number; processStart?: string; startedAt: number;
+  pid: number; processStart?: string; routePid?: number; routeProcessStart?: string; startedAt: number;
   start?: "sending" | "sent" | "failed" | "suppressed";
   end?: "sending" | "sent" | "failed" | "suppressed";
   reason?: string;
@@ -60,18 +60,21 @@ const send: LifecycleSend = async (bot, record, text) => {
   if (record.routeId) {
     const routes = fileRoutes(bot.token);
     const current = routes.get(record.routeId);
-    const resumed = current?.pid !== undefined && (current.pid !== record.pid || current.processStart !== record.processStart);
+    const routePid = record.routePid ?? record.pid;
+    const routeProcessStart = record.routeProcessStart ?? record.processStart;
+    const resumed = Boolean(record.reason) && current?.pid !== undefined &&
+      (current.pid !== routePid || current.processStart !== routeProcessStart);
     session.setRoute({ ...routes, register() {} }, { id: resumed ? `${record.routeId}:ended:${record.id}` : record.routeId,
       chatId: bot.chatId, botName: record.botName,
       provider: record.provider, repo: record.repo, branch: record.branch, worktree: record.worktree,
-      allowFrom: bot.allowFrom, pid: record.pid, processStart: record.processStart,
+      allowFrom: bot.allowFrom, pid: routePid, processStart: routeProcessStart,
       ...(record.reason ? { expiresAt: Date.now() } : {}) });
   }
   await session.api("sendMessage", { chat_id: bot.chatId, text }, AbortSignal.timeout(5000));
 };
 const message = (record: LifecycleSession, event: string) => [
   `Telex session ${event}`, `Bot: ${record.botName}`, `Agent: ${record.provider}`, `Session: ${record.routeId ?? record.id}`,
-  `Repository: ${record.repo}`, `Branch: ${record.branch}`, `Worktree: ${record.worktree}`,
+  `Repository: ${record.repo}`,
 ].join("\n");
 
 async function notify(id: string, event: "start" | "end", bot: Bot, sender: LifecycleSend) {
@@ -94,17 +97,25 @@ async function notify(id: string, event: "start" | "end", bot: Bot, sender: Life
 }
 
 export async function announceSession(input: {
-  id: string; botName: string; bot: Bot; provider: string; project: string; routeId?: string; pid?: number;
+  id: string; botName: string; bot: Bot; provider: string; project: string; routeId?: string;
+  pid?: number; processStart?: string; routePid?: number; routeProcessStart?: string; root?: boolean;
 }, sender: LifecycleSend = send): Promise<void> {
   const configured = configuredProject(input.project);
+  const pid = input.pid ?? process.pid;
+  let hostStart = input.processStart;
+  try { hostStart ??= processStart(pid); } catch { /* other operating systems have PID-only liveness */ }
   withStateLock(pathFor(input.id), () => {
-    if (read(input.id)) return;
-    const pid = input.pid ?? process.pid;
-    let start: string | undefined;
-    try { start = processStart(pid); } catch { /* other operating systems have PID-only liveness */ }
+    const existing = read(input.id);
+    if (existing) {
+      if (input.root && !existing.end) write({ ...existing, botName: input.botName, provider: input.provider,
+        project: input.project, routeId: input.routeId, pid, processStart: hostStart,
+        routePid: input.routePid ?? pid, routeProcessStart: input.routeProcessStart ?? hostStart, ...sessionIdentity(input.project) });
+      return;
+    }
     write({ id: input.id, botName: input.botName, botHash: createHash("sha256").update(input.bot.token).digest("hex"), chatId: input.bot.chatId, provider: input.provider, project: input.project,
-      routeId: input.routeId, pid, processStart: start, startedAt: Date.now(),
-      ...(configured ? {} : { start: "suppressed" as const }), ...sessionIdentity(input.project) });
+      routeId: input.routeId, pid, processStart: hostStart,
+      routePid: input.routePid ?? pid, routeProcessStart: input.routeProcessStart ?? hostStart, startedAt: Date.now(),
+      ...(!configured || !input.root ? { start: "suppressed" as const } : {}), ...sessionIdentity(input.project) });
   });
   await notify(input.id, "start", input.bot, sender);
 }
@@ -122,9 +133,13 @@ export async function finishSession(id: string, reason = "ended", sender: Lifecy
   const removeRoute = () => {
     if (!record.routeId) return;
     const routes = fileRoutesByHash(record.botHash);
-    routes.remove(record.routeId, { pid: record.pid, processStart: record.processStart });
+    routes.remove(record.routeId, { pid: record.routePid ?? record.pid, processStart: record.routeProcessStart ?? record.processStart });
   };
   removeRoute();
+  if (record.start === "suppressed") {
+    withStateLock(pathFor(id), () => { const current = read(id)!; current.end = "suppressed"; write(current); });
+    return;
+  }
   if (!bot || createHash("sha256").update(bot.token).digest("hex") !== record.botHash || String(bot.chatId) !== String(record.chatId)) {
     withStateLock(pathFor(id), () => { const current = read(id)!; current.end = "suppressed"; write(current); });
     return;

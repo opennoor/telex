@@ -13,6 +13,12 @@ export function hostSessionId(agent: string, id: string, worktree: string): stri
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20, 32)}`;
 }
 
+/** Session lifecycle events are root-only in Codex; Claude marks child hooks with agent_id. */
+export function rootLifecycleHook(agent: string, event: string, agentId?: string): boolean {
+  return (event === "SessionStart" || event === "SessionEnd") &&
+    (agent === "codex" || agent === "claude-code" && !agentId);
+}
+
 /** Hook JSON is returned as MCP text, which Codex and Claude parse like command-hook stdout. */
 export function hookOutput(event: "SessionStart" | "SessionEnd" | "UserPromptSubmit" | "PostToolUse" | "Stop", messages: Delivered[]) {
   if (event === "SessionEnd") return {};

@@ -132,7 +132,9 @@ if(process.env.RECOVER_ID)await recoverCodex(Number(process.env.RECOVER_ID),true
   assert.match(records(two.rpcLog).find((m) => m.method === "turn/start").params.input[0].text, /second payload/);
   await until(() => records(one.apiLog).some((c) => c.params.text?.includes("final-one")) && readCodexState(pathTwo)?.outbox?.some((item) => item.text === "final-two") === true);
   assert.equal(records(one.apiLog).some((c) => c.params.text?.includes("must-not-forward")), false);
-  assert.ok(records(one.apiLog).find((c) => c.params.text?.includes("final-one"))!.params.text.includes(stateOne.routeId!));
+  const finalOne = records(one.apiLog).find((c) => c.params.text?.includes("final-one"))!.params.text;
+  assert.match(finalOne, /final-one/);
+  assert.match(finalOne, /↳ branch .* · worktree/);
   one.child.kill("SIGTERM"); two.child.kill("SIGTERM");
   await Promise.all([exited(one.child), exited(two.child)]);
   assert.equal(readCodexState(pathOne)?.pid, undefined);
@@ -142,7 +144,8 @@ if(process.env.RECOVER_ID)await recoverCodex(Number(process.env.RECOVER_ID),true
   const recovered = launch(second, "recover", 3000, { RECOVER_ID: "2" });
   await exited(recovered.child);
   const recoveredMessage = records(recovered.apiLog).find((c) => c.params.text?.includes("final-two"));
-  assert.ok(recoveredMessage?.params.text.includes(stateTwo.routeId!));
+  assert.match(recoveredMessage?.params.text ?? "", /final-two/);
+  assert.match(recoveredMessage?.params.text ?? "", /↳ branch .* · worktree/);
   assert.equal(readCodexState(pathTwo)?.outbox?.length, 0);
   assert.equal(fileRoutes("fake-token").get(stateTwo.routeId!), undefined, "recovery CLI is not an active destination");
   const firstQueue = scopedInbox(store, `${hash}:${stateOne.routeId}`);
@@ -155,13 +158,19 @@ if(process.env.RECOVER_ID)await recoverCodex(Number(process.env.RECOVER_ID),true
   await exited(retry.child);
   assert.deepEqual(firstQueue.take("7").map((message) => message.text), ["uncertain first"]);
   assert.equal(secondQueue.claimed("7")[0].message_id, 51, "other thread's uncertain delivery is untouched");
-  assert.ok(records(retry.apiLog).find((call) => call.method === "editMessageText")!.params.text.includes(stateOne.routeId!));
+  const retryEdit = records(retry.apiLog).find((call) => call.method === "editMessageText")!.params.text;
+  assert.match(retryEdit, /Held for the agent.s next check-in/);
+  assert.match(retryEdit, /↳ branch .* · worktree/);
   const resumed = launch(first, "one", 4000);
   await until(() => records(resumed.rpcLog).some((m) => m.method === "thread/resume") && Boolean(fileRoutes("fake-token").get(stateOne.routeId!)));
   assert.equal(readCodexState(pathOne)?.routeId, stateOne.routeId);
+  assert.equal([...records(one.apiLog), ...records(resumed.apiLog)].filter((call) => call.params.text?.includes("session started")).length, 1,
+    "resuming the same root thread does not create another start notification");
   listener = central();
   send(5, 1001, "reply after bridge restart");
   await until(() => records(resumed.rpcLog).some((m) => m.method === "turn/start"));
   assert.match(records(resumed.rpcLog).find((m) => m.method === "turn/start").params.input[0].text, /reply after bridge restart/);
   resumed.child.kill("SIGTERM"); await exited(resumed.child);
+  assert.equal([...records(one.apiLog), ...records(resumed.apiLog)].filter((call) => call.params.text?.includes("session ended")).length, 1,
+    "the resumed root thread keeps exactly one end notification");
 });

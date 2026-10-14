@@ -41,19 +41,23 @@ function request(path, input) {
 }
 async function main() {
   if (process.env.TELEX_CODEX_BRIDGE === "1") return;
-  const { hook_event_name: event, session_id: host_session_id, cwd: project_path, prompt, stop_hook_active } = JSON.parse(readFileSync(0, "utf8"));
+  const { hook_event_name: event, session_id: host_session_id, cwd: project_path, prompt, stop_hook_active, agent_id } = JSON.parse(readFileSync(0, "utf8"));
   if (!["SessionStart", "SessionEnd", "UserPromptSubmit", "PostToolUse", "Stop"].includes(event) || typeof host_session_id !== "string" || typeof project_path !== "string") return;
   const chain = ancestors(process.pid);
   const hostPid = chain.find((pid) => {
     try { return /^(codex|claude)(?:-code)?$/.test(readFileSync(`/proc/${pid}/comm`, "utf8").trim()); }
     catch { return false; }
   });
+  const rootLifecycle = (event === "SessionStart" || event === "SessionEnd") &&
+    (agent === "codex" || agent === "claude-code" && !agent_id);
   const input = { event, host_session_id, project_path, agent,
+    ...(typeof agent_id === "string" ? { agent_id } : {}),
+    ...(rootLifecycle ? { root_session: true, ...(hostPid ? { host_pid: hostPid, host_process_start: start(hostPid) } : {}) } : {}),
     ...(event === "UserPromptSubmit" && typeof prompt === "string" ? { prompt } : {}),
     ...(event === "Stop" ? { stop_hook_active: stop_hook_active === true || stop_hook_active === "true" } : {}) };
   // SessionStart may precede MCP startup. Only its exact live host ancestor may consume this spool.
   const spool = hostPid && join(dirname(state), `hook-start-${createHash("sha256").update(`${agent}:${hostPid}`).digest("hex")}.json`);
-  if (event === "SessionStart" && spool) {
+  if (event === "SessionStart" && rootLifecycle && spool) {
     mkdirSync(dirname(state), { recursive: true, mode: 0o700 });
     const tmp = `${spool}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify({ ...input, hostPid, hostStart: start(hostPid), at: Date.now() }), { mode: 0o600 });

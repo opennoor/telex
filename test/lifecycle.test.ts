@@ -18,7 +18,7 @@ function fixture(configured = true) {
   if (configured) writeFileSync(join(dir, ".telex.json"), JSON.stringify({ bot: "main" }));
   const messages: string[] = [];
   const send: LifecycleSend = async (_bot, _record, text) => { messages.push(text); };
-  return { dir, bot, messages, send, input: { id: "session-1", botName: "main", bot, provider: "codex", project: dir } };
+  return { dir, bot, messages, send, input: { id: "session-1", botName: "main", bot, provider: "codex", project: dir, root: true } };
 }
 
 test("lifecycle announces once, leaves live idle process alive, and ends once across reloads", async () => {
@@ -28,7 +28,7 @@ test("lifecycle announces once, leaves live idle process alive, and ends once ac
   await sweepSessions(f.send);
   assert.equal(f.messages.length, 1);
   assert.match(f.messages[0], /started\nBot: main\nAgent: codex\nSession: session-1/);
-  assert.match(f.messages[0], /Branch: unknown\nWorktree:/);
+  assert.match(f.messages[0], /Repository:/);
   await Promise.all([finishSession(f.input.id, "ended", f.send), finishSession(f.input.id, "ended", f.send)]);
   await sweepSessions(f.send);
   assert.equal(f.messages.length, 2);
@@ -62,6 +62,52 @@ test("process exit generates one durable crash disposition, never idle timeout",
     const path = join(f.dir, "lifecycle", readdirSync(join(f.dir, "lifecycle")).find((name) => name.endsWith(".json"))!);
     assert.equal(JSON.parse(readFileSync(path, "utf8")).end, "sent");
   } finally { child.kill(); }
+});
+
+test("root resume keeps one start and one end while refreshing the live host owner", async () => {
+  const f = fixture();
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  try {
+    await announceSession({ ...f.input, pid: child.pid }, f.send);
+    await announceSession({ ...f.input, pid: process.pid }, f.send);
+    await Promise.all([finishSession(f.input.id, "ended", f.send), finishSession(f.input.id, "ended", f.send)]);
+    assert.equal(f.messages.length, 2);
+    const path = join(f.dir, "lifecycle", readdirSync(join(f.dir, "lifecycle")).find((name) => name.endsWith(".json"))!);
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).pid, process.pid);
+  } finally { child.kill(); }
+});
+
+test("suppressed child lifecycle records stay silent through crash sweeping", async () => {
+  const f = fixture();
+  const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  try {
+    await announceSession({ ...f.input, id: "child-session", root: false, pid: child.pid }, f.send);
+    const exited = once(child, "exit"); child.kill(); await exited;
+    await sweepSessions(f.send);
+    await sweepSessions(f.send);
+    assert.deepEqual(f.messages, []);
+    const path = join(f.dir, "lifecycle", readdirSync(join(f.dir, "lifecycle")).find((name) => name.endsWith(".json"))!);
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).start, "suppressed");
+    assert.equal(JSON.parse(readFileSync(path, "utf8")).end, "suppressed");
+  } finally { child.kill(); }
+});
+
+test("unattested generic MCP lifecycle stays suppressed and cannot rewrite a root record", async () => {
+  const f = fixture();
+  await announceSession({ ...f.input, id: "generic-mcp", root: undefined }, f.send);
+  await finishSession("generic-mcp", "ended", f.send);
+  assert.deepEqual(f.messages, []);
+
+  const root = fixture();
+  await announceSession({ ...root.input, id: "shared-root", routeId: "root-route" }, root.send);
+  await announceSession({ ...root.input, id: "shared-root", root: false, provider: "child", routeId: "child-route", pid: process.pid + 1 }, root.send);
+  const path = join(root.dir, "lifecycle", readdirSync(join(root.dir, "lifecycle")).find((name) => name.endsWith(".json") &&
+    JSON.parse(readFileSync(join(root.dir, "lifecycle", name), "utf8")).id === "shared-root")!);
+  const record = JSON.parse(readFileSync(path, "utf8"));
+  assert.equal(record.provider, "codex");
+  assert.equal(record.routeId, "root-route");
+  assert.equal(record.pid, process.pid);
+  assert.equal(root.messages.filter((text) => text.includes("session started")).length, 1);
 });
 
 test("failed termination notification removes routing and is not replayed after restart", async () => {

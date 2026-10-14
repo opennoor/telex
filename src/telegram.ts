@@ -2,6 +2,7 @@
 import { memoryInbox, type InboxStore } from "./inbox.ts";
 import { callbackKey, textKey, type AnswerStore } from "./answers.ts";
 import { routeAuthorized, routeLabel, type RouteStore, type RouteRegistration } from "./routes.ts";
+import { basename } from "node:path";
 
 export type Update = {
   update_id: number;
@@ -112,6 +113,15 @@ export const stripHtml = (text: string) =>
 /** Telegram counts message length in UTF-16 code units, which is what JS strings already are. */
 export const MAX_MESSAGE_LEN = 4000;
 
+function routeFooter(route: RouteRegistration | undefined, html: boolean) {
+  if (!route) return "";
+  const branch = route.branch && route.branch !== "unknown" ? `branch ${route.branch.slice(0, 80)}` : "";
+  const tree = route.worktree && basename(route.worktree);
+  const worktree = tree ? `worktree ${tree}` : "";
+  const clue = [branch, worktree].filter(Boolean).join(" · ") || `session ${route.id}${route.repo ? ` · repo ${basename(route.repo)}` : ""}`;
+  return `\n\n${html ? `<i>↳ ${escapeHtml(clue)}</i>` : `↳ ${clue}`}`;
+}
+
 export type CallbackCtx = { callbackId: string; fromId?: number; chatId?: number };
 type CallbackWaiter = (payload: string, ctx: CallbackCtx) => void;
 type TextWaiter = (text: string, fromId?: number) => void;
@@ -160,13 +170,10 @@ export class BotSession {
   constructor(api: Fetcher, pollTimeout = 30) {
     this.api = async (method, params, signal) => {
       const route = this.registration;
-      const prefix = route
-        ? params.parse_mode === "HTML" ? `<b>${escapeHtml(routeLabel(route))}</b>\n\n` : `${routeLabel(route)}\n\n`
-        : "";
       const outbound = method === "sendMessage" || method === "editMessageText";
+      const footer = routeFooter(route, params.parse_mode === "HTML");
       let body = String(params.text ?? "");
-      if (prefix && body.startsWith(prefix)) body = body.slice(prefix.length);
-      const capacity = MAX_MESSAGE_LEN - prefix.length;
+      const capacity = MAX_MESSAGE_LEN - footer.length;
       const parts: string[] = [];
       if (outbound) {
         if (method === "sendMessage") {
@@ -177,16 +184,17 @@ export class BotSession {
             body = body.slice(cut).replace(/^\n/, "");
           }
         }
-        // Telegram cannot split an edit; reserve room for identity and a settled question's footer.
+        // Telegram cannot split an edit; reserve room for a settled question's footer.
         parts.push(body.length > capacity ? `${body.slice(0, capacity - 1)}…` : body);
       }
       let result: any;
       for (const [index, part] of (outbound ? parts : [""]).entries()) {
-        const tagged = outbound ? { ...params, text: prefix + part, ...(method === "sendMessage" && index < parts.length - 1 ? { reply_markup: undefined } : {}) } : params;
+        const lastPart = index === parts.length - 1;
+        const tagged = outbound ? { ...params, text: part + (lastPart ? footer : ""), ...(method === "sendMessage" && !lastPart ? { reply_markup: undefined } : {}) } : params;
         try { result = await api(method, tagged, signal); }
         catch (error) {
           if (!outbound || !(error instanceof TelegramError) || !/parse|entit|tag/i.test(error.description)) throw error;
-          result = await api(method, { ...tagged, text: stripHtml(prefix + part), parse_mode: undefined }, signal);
+          result = await api(method, { ...tagged, text: stripHtml(String(tagged.text ?? "")), parse_mode: undefined }, signal);
         }
         if (route && method === "sendMessage" && result?.message_id !== undefined) {
           this.routeStore?.recordMessage(params.chat_id as string | number, result.message_id, route.id);
@@ -198,7 +206,7 @@ export class BotSession {
   }
 
   get messageCapacity() {
-    return MAX_MESSAGE_LEN - (this.registration ? `<b>${escapeHtml(routeLabel(this.registration))}</b>\n\n`.length : 0) - 100;
+    return MAX_MESSAGE_LEN - 100 - routeFooter(this.registration, true).length;
   }
 
   /** A client owns one durable destination; never share its session object with another route. */

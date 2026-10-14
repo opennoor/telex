@@ -229,8 +229,9 @@ test("wake disable retains exact recovery identity and cannot recover another ro
     run("recover", "11", "--delivered");
     assert.deepEqual(exact.claimed("7"), []);
     assert.equal(other.claimed("7")[0].message_id, 22);
-    assert.match(JSON.parse(readFileSync(log, "utf8")).text, /main · codex/);
-    assert.match(JSON.parse(readFileSync(log, "utf8")).text, /Delivered|Submitted/);
+    const receipt = JSON.parse(readFileSync(log, "utf8")).text;
+    assert.match(receipt, /Delivered|Submitted/);
+    assert.match(receipt, /\n\n<i>↳ branch topic · worktree /);
     assert.equal(fileRoutes(token).get(route.id)?.pid, process.pid, "recovery never overwrites a live route");
   } finally {
     if (oldState === undefined) delete process.env.TELEX_STATE; else process.env.TELEX_STATE = oldState;

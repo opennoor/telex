@@ -11,20 +11,24 @@ administrator-enabled linger. Telex never changes linger. Without the listener, 
 processes elect a fallback poller. Durable cursor and route state prevent duplicate polls and
 cross-session queue collection.
 
-`SessionStart` and `SessionEnd` use command hooks for both hosts. Startup teaches Telegram controls
-and configured repositories announce their branch/worktree early. Linux startup events that precede
-MCP readiness are spooled for the exact host PID/start identity. The command adapter discovers the
-exact worktree and host process before binding; an ambiguous match leaves messages queued. Codex
-requires review and trust for plugin hooks. Claude's normal prompt/tool/Stop hooks use `host_hook`;
-Codex uses the private local socket. These collect Telegram messages as host context. `Stop` is a
-turn boundary, never a termination notice. Normal close reports termination; the persistent listener
-reports a crash only after the process exits. Uncertain notification sends are never replayed.
+`SessionStart` and `SessionEnd` use command hooks for both hosts. Only host-attested root sessions
+with a stable host process identity announce lifecycle; Claude and Codex subagents remain routable
+without start/end notices. MCP-only connections lack that trusted root identity and do not emit
+lifecycle notices. Startup teaches Telegram controls and configured roots announce their
+branch/worktree early. Routed messages end with a compact branch/worktree hint, including the
+default branch and worktree. Linux startup events that precede MCP readiness are spooled for the exact host
+PID/start identity. The command adapter discovers the exact worktree and host process before
+binding; an ambiguous match leaves messages queued. Codex requires review and trust for plugin
+hooks. Claude's normal prompt/tool/Stop hooks use `host_hook`; Codex uses the private local socket.
+These collect Telegram messages as host context. `Stop` is a turn boundary, never a termination
+notice. Attested root `SessionEnd` reports normal termination; the persistent listener reports a
+crash only after the host process exits. Uncertain notification sends are never replayed.
 
-Every outgoing message identifies the bot, provider, session, repository, branch and worktree.
-Replies to a Telex message return to its exact session. Plain text with several live destinations
-shows a session selector. Question buttons and selections preserve sender/chat allowlists and reject
-ended sessions. `send_to_user` with `options` creates choice buttons; `expect_text` creates a Reply
-button; neither creates a one-way notification. Keep `heartbeat` calls during long gaps between hooks.
+Replies to a Telex message return to its exact session through a durable server-side message map.
+Plain text with several live destinations shows a session selector. Question buttons and selections
+preserve sender/chat allowlists and reject ended sessions. `send_to_user` with `options` creates
+choice buttons; `expect_text` creates a Reply button; neither creates a one-way notification. Keep
+`heartbeat` calls during long gaps between hooks.
 
 Hooks cannot wake an idle or terminated host. Claude channels require explicit per-session host
 opt-in, preview access and applicable organization/plugin allowlists; an MCP connection alone is

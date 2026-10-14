@@ -32,7 +32,7 @@ Pin a version, or take it straight from the GitHub release if you prefer not to 
 the registry:
 
 ```sh
-npm i -g @sojaner/telex@1.0.0        # pin an exact published version
+npm i -g @sojaner/telex@1.0.1        # pin an exact published version
 npm i -g https://github.com/Sojaner/telex/releases/latest/download/telex.tgz
 ```
 
@@ -59,13 +59,15 @@ plugin through that host's marketplace. Use `telex install codex` or `telex inst
 script. In each project, run `telex add` and `telex project <name>` to choose a bot. The plugin
 contains no bot tokens and keeps its MCP registration in `plugins/telex/.mcp.json`.
 
-The plugin announces configured repositories at session startup, including branch and worktree,
-and reports normal termination. `SessionStart` and `SessionEnd` use command hooks; message delivery
-uses `UserPromptSubmit`, `PostToolUse`, and `Stop`. `Stop` ends a turn, not the session. Codex requires
-review and trust for bundled hooks. Startup instructions explain choice buttons, typed replies and
-message collection. When startup precedes MCP readiness on Linux, the command hook saves the exact
-host process identity for its MCP child. Concurrent conversations in the same worktree are kept
-separate; ambiguous hook matches leave messages queued.
+The plugin announces only host-attested root sessions at startup and normal termination, including
+branch and worktree. Claude and Codex subagents keep message routing without lifecycle notices.
+MCP-only connections have no trusted root identity, so they do not emit lifecycle notices.
+`SessionStart` and `SessionEnd` use command hooks; message delivery uses `UserPromptSubmit`,
+`PostToolUse`, and `Stop`. `Stop` ends a turn, not the session. Codex requires review and trust for
+bundled hooks. Startup instructions explain choice buttons, typed replies and message collection.
+When startup precedes MCP readiness on Linux, the command hook saves the exact host process identity
+for its MCP child. Concurrent conversations in the same worktree are kept separate; ambiguous hook
+matches leave messages queued.
 
 Hooks deliver only when the host reaches an event. For an open idle session use Claude's explicitly
 enabled channel mode, the managed Codex bridge, or the conditional tmux wake mode below. Keep manual
@@ -196,12 +198,13 @@ prevents overlapping `getUpdates`; connected MCP processes take over if the list
 A daemon keeps Telegram reachable but cannot start a terminated AI host. With no connected session,
 messages are rejected clearly.
 
-Configured repositories announce their session before the model's first tool call. Generic MCP
-connections initially identify as `mcp`, then refine that identity when the host checks in without
-creating a second lifetime. Normal disconnects report termination; the listener detects crashed
-processes by PID and process start identity, not an idle timeout. Notification attempts are durable:
-an uncertain Telegram send is not replayed automatically, so a network failure or crash during the
-send can omit a notice. Keep the listener running for crash notices after all MCP processes exit.
+Configured root sessions announce before the model's first tool call. Generic MCP connections
+initially identify as `mcp`, then refine that identity when the host checks in; without a trusted
+root hook they do not emit lifecycle notices. Normal root disconnects report termination; the
+listener detects crashed host processes by PID and process start identity, not an idle timeout.
+Notification attempts are durable: an uncertain Telegram send is not replayed automatically, so a
+network failure or crash during the send can omit a notice. Keep the listener running for crash
+notices after all MCP processes exit.
 
 ## The config file
 
@@ -306,8 +309,9 @@ use the absolute path, or point Node at the installed entry point:
 ### Per-project configuration
 
 Choose a project bot when you want separate chats or mute settings. The global default supports
-full questions, buttons and replies from any connected session. Every outgoing message identifies
-its bot, provider, session, repository, branch and worktree.
+full questions, buttons and replies from any connected session. Reply destinations are stored with
+each Telegram message, so messages begin with their substantive content and end with a compact
+branch/worktree hint, including for the default branch and worktree.
 
 ```sh
 cd ~/code/acme-api
@@ -494,7 +498,7 @@ Codex plugin from another terminal, then check that `telex list` shows nonempty 
 your bot:
 
 ```sh
-npm i -g @sojaner/telex@1.0.0
+npm i -g @sojaner/telex@1.0.1
 telex install codex
 telex list
 ```
@@ -510,7 +514,7 @@ exec codex --no-daemon resume <session-id>
 server; installing the package cannot reload an already-running MCP process. `exec` makes Codex
 the pane process rather than leaving a shell underneath it. If the old pane closed on exit, create
 a new dedicated tmux pane and run the same `exec codex --no-daemon resume <session-id>` command in
-it. Finish a new turn so the v1.0.0 Telex server sees a fresh `Stop` hook, then detach. On a new
+it. Finish a new turn so the v1.0.1 Telex server sees a fresh `Stop` hook, then detach. On a new
 conversation, start it directly with
 `exec codex --no-daemon` and likewise finish a turn before binding.
 

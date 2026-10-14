@@ -5,9 +5,10 @@ import { mkdtempSync, mkdirSync, writeFileSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileRoutes, type RouteRegistration } from "../src/routes.ts";
-import { BotSession, type Incoming, type Update } from "../src/telegram.ts";
+import { BotSession, TelegramError, type Incoming, type Update } from "../src/telegram.ts";
 import { memoryInbox, scopedInbox } from "../src/inbox.ts";
 import { fileAnswers } from "../src/answers.ts";
+import { ask } from "../src/ask.ts";
 
 function isolated(t: { after: (fn: () => void) => void }) {
   const previous = process.env.TELEX_STATE;
@@ -30,15 +31,14 @@ function fake() {
   return { session, calls };
 }
 
-test("all outgoing messages identify their bot, provider, session, repo, branch and worktree; replies survive listener restart", async (t) => {
+test("outgoing text starts with the requested content and replies survive client restart", async (t) => {
   isolated(t);
   const client = fake();
-  client.session.setRoute(fileRoutes("token"), route("one"));
+  client.session.setRoute(fileRoutes("token"), route("one", { branch: "main", repo: "/repo", worktree: "/repo" }));
   const sent = await client.session.api("sendMessage", { chat_id: 7, text: "Hello", parse_mode: "HTML" });
   await client.session.api("editMessageText", { chat_id: 7, message_id: sent.message_id, text: "Updated" });
-  for (const call of client.calls) {
-    for (const value of ["work", "codex", "session one", "/repo", "one", "/trees/one"]) assert.ok(call.params.text.includes(value));
-  }
+  assert.equal(client.calls[0].params.text, "Hello\n\n<i>↳ branch main · worktree repo</i>");
+  assert.equal(client.calls[1].params.text, "Updated\n\n↳ branch main · worktree repo");
   const routed: string[] = [];
   const restarted = fake();
   restarted.session.setRouteStore(fileRoutes("token"), (destination, incoming) => routed.push(`${destination.id}:${incoming.text}`));
@@ -50,6 +50,42 @@ test("all outgoing messages identify their bot, provider, session, repo, branch 
   restarted.session.dispatch(message(3, "stale", sent.message_id));
   assert.deepEqual(routed, ["one:for one"]);
   assert.match(restarted.calls.at(-1)!.params.text, /stale or unknown/);
+});
+
+test("alternate branch and worktree hints follow the body on sends, edits, and ask chunks", async (t) => {
+  isolated(t);
+  const client = fake();
+  client.session.setRoute(fileRoutes("token"), route("one", { branch: "feature", repo: "/repo", worktree: "/repo/trees/feature" }));
+  const long = "content ".repeat(1100);
+  await client.session.api("sendMessage", { chat_id: 7, text: long, parse_mode: "HTML", reply_markup: { inline_keyboard: [[{ text: "Yes", callback_data: "telex:q:0" }]] } });
+  await client.session.api("editMessageText", { chat_id: 7, message_id: 101, text: "Changed", parse_mode: "HTML" });
+  await ask(client.session, 7, { project: "Project", message: "Question", timeoutSeconds: 1 });
+  assert.ok(client.calls.length > 2);
+  const buttonPart = client.calls.findIndex((call) => Boolean(call.params.reply_markup));
+  for (const [index, call] of client.calls.slice(0, buttonPart + 1).entries()) {
+    assert.ok(call.params.text.length <= 4000);
+    if (index === 0) assert.ok(call.params.text.startsWith("content "));
+    if (index < buttonPart) assert.doesNotMatch(call.params.text, /↳/);
+  }
+  assert.match(client.calls[buttonPart].params.text, /<i>↳ branch feature · worktree feature<\/i>$/);
+  assert.equal(Boolean(client.calls[0].params.reply_markup), false);
+  assert.equal(Boolean(client.calls[1].params.reply_markup), false);
+  assert.match(client.calls.at(-2)!.params.text, /^Changed\n\n<i>↳ branch feature · worktree feature<\/i>$/);
+  assert.match(client.calls.at(-1)!.params.text, /^<b>Project<\/b>\n\nQuestion\n\n<i>↳ branch feature · worktree feature<\/i>$/);
+});
+
+test("default branch and alternate worktree get a footer that survives HTML fallback", async (t) => {
+  isolated(t);
+  const calls: any[] = [];
+  const session = new BotSession(async (method, params) => {
+    calls.push({ method, params });
+    if (params.parse_mode === "HTML") throw new TelegramError(method, "can't parse entities");
+    return { message_id: 10 };
+  });
+  session.setRoute(fileRoutes("token"), route("one", { branch: "main", repo: "/repo", worktree: "/repo/trees/alt" }));
+  await session.api("sendMessage", { chat_id: 7, text: "Hello", parse_mode: "HTML" });
+  assert.equal(calls[1].params.text, "Hello\n\n↳ branch main · worktree alt");
+  assert.equal(calls[1].params.parse_mode, undefined);
 });
 
 test("concurrent routes require an explicit selection, bound to its user and chat and consumable once across restart", (t) => {
@@ -156,7 +192,7 @@ test("dead or reused process destinations cannot receive replies", (t) => {
   assert.deepEqual(routes.active(7), []);
 });
 
-test("long identified messages stay within Telegram limits and keep buttons only on the last part", async (t) => {
+test("long content stays within Telegram limits, routes each part, and keeps buttons only on the last part", async (t) => {
   isolated(t);
   const client = fake();
   client.session.setRoute(fileRoutes("token"), route("one", { repo: "&".repeat(200), worktree: "/long/".repeat(100) }));
@@ -164,7 +200,7 @@ test("long identified messages stay within Telegram limits and keep buttons only
   assert.ok(client.calls.length > 1);
   for (const [index, call] of client.calls.entries()) {
     assert.ok(call.params.text.length <= 4000);
-    assert.match(call.params.text, /session one/);
+    if (index === 0) assert.ok(call.params.text.startsWith("body "));
     assert.equal(Boolean(call.params.reply_markup), index === client.calls.length - 1);
     assert.equal(fileRoutes("token").message(7, index + 101)?.id, "one");
   }
